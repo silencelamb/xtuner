@@ -99,3 +99,31 @@ Taken: (c) plus the fake-PG L0 tests which already pin the exact 16- and 64-rank
 
 Reference curves come from the legacy path at the same `ep` (bit-for-bit the same expert math)
 and from the `ep=1` FSDP-8 baseline.
+
+## D7 / D8 resolution (PR-3)
+
+- fp8: `Float8Handler.pad_for_fsdp` takes an optional `expert_fsdp_mesh`; grouped-linear (expert)
+  weights are padded for `efsdp` FSDP chunks, everything else for `dp_shard`. `build_reduce_mesh`
+  builds two sets of tile-wise "reduce max" meshes on the decoupled path, each with the rank stride
+  of its class (dense: stride 1 along the flattened `dp_shard`; experts: stride `ep` along `efsdp`),
+  and `precompute_tilewise_float8_scale_for_fsdp` is called once per class. The legacy path still
+  takes the original single-mesh code path (`expert_fsdp_mesh is None`). Tensor-wise fp8 only
+  applies to dense linears, whose shard group is still `fsdp_mesh`, so it needs no change.
+- RL weight sync: `_fsdp_foreach_allgather` picks the gather group per `LoadSpec` — the `efsdp`
+  group for specs that carry a shard on it, `fsdp_mesh`'s group otherwise — so EP-local expert
+  slices are still reconstructed with an FSDP-only gather.
+- `expert_fsdp_mesh` moved to `BaseModel` (always `None` for dense models) so the float8 handler
+  wiring in `BaseModel.float8_handler` needs no MoE-specific branch.
+- Training is not bit-deterministic run to run (see `reports/L3.md`); acceptance of DCP resume and
+  cross-layout comparisons is therefore judged against the measured run-to-run noise floor.
+
+## D11. Environment facts that shaped the fp8 / GLM-5.2 validation
+
+- The tiny (hidden 512, moe_inter 256) Qwen3-MoE crashes in the fp8 grouped GEMM kernel
+  (`adaptive_gemm` TMA descriptor assertion → SIGSEGV) on the **legacy** `ep=8` path, reproduced on
+  the Phase-0 commit (`2098db9e`) with the same command. It is a kernel shape limitation unrelated
+  to this work; fp8 numerics are therefore validated on the 3.4B "medium" model and on GLM-5.2-30B.
+- `transformers` on this machine is an editable 4.57.0 checkout without `glm_moe_dsa`, while
+  `pyproject.toml` pins `transformers==5.14.1`. GLM-5.2 runs use an isolated
+  `pip install --no-deps --target <dir> transformers==5.14.1 huggingface_hub==1.5.0 "safetensors>=0.8" "regex>=2025.10.22"`
+  prepended to `PYTHONPATH`; the global environment is left untouched.
