@@ -76,3 +76,20 @@ per-spec gather group; tracked for PR-3.
 Four commits: (1) Phase-0 L0 tests pinning the legacy layout + baseline report; (2) PR-1 basic
 decoupling (config, mesh, two-level `fully_shard`, gradient scaling, L0/L1); (3) PR-2 HSDP
 coexistence + L2; (4) PR-3 ecosystem (HF/DCP, fp8) + L3.
+
+## D10. L2 on a single node: scaled-down topologies instead of 16 emulated ranks
+
+Only one 8-GPU node is available. NCCL refuses two ranks on the same GPU inside one communicator,
+and the MoE model needs CUDA (streams, Triton grouped GEMM), so a 16-rank torchrun cannot be
+emulated with 2 processes per GPU. Options: (a) wait for a second node; (b) gloo/CPU (FSDP2 works
+on CPU but the MoE kernels do not); (c) run the *same mesh structures* at 8 ranks.
+Taken: (c) plus the fake-PG L0 tests which already pin the exact 16- and 64-rank mesh shapes:
+
+| DESIGN §6-L2 scenario (16 ranks) | 8-rank equivalent | structure exercised |
+|---|---|---|
+| `ep=8, decouple, dp_shard=16` (efsdp=2) | `ep=4, decouple` (efsdp=2) | experts also FSDP-sharded (`_StridedShard` over efsdp) |
+| `ep=8, hsdp_sharding_size=8` (replicate=2) | `ep=4, hsdp_sharding_size=4` (replicate=2, efsdp=1) | the formerly asserted HSDP+EP combination |
+| — | `ep=2, hsdp_sharding_size=4` (replicate=2, efsdp=2) | replicate and efsdp both > 1 |
+
+Reference curves come from the legacy path at the same `ep` (bit-for-bit the same expert math)
+and from the `ep=1` FSDP-8 baseline.
