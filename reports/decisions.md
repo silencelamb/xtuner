@@ -77,6 +77,12 @@ Four commits: (1) Phase-0 L0 tests pinning the legacy layout + baseline report; 
 decoupling (config, mesh, two-level `fully_shard`, gradient scaling, L0/L1); (3) PR-2 HSDP
 coexistence + L2; (4) PR-3 ecosystem (HF/DCP, fp8) + L3.
 
+Note on PR-2: the `replicate` mesh dimension is produced by the same `init_device_mesh` call as
+`efsdp`/`ep`, and FSDP2 handles the `(Replicate, Shard)` placements itself, so there is no
+HSDP-specific execution code to split out of PR-1. PR-2 is therefore the validation commit: the
+HSDP fake-PG placement tests live in PR-1's test file, and PR-2 adds `reports/L2.md` (efsdp > 1,
+HSDP + EP, DeepEP and empty-expert smokes, legacy regression).
+
 ## D10. L2 on a single node: scaled-down topologies instead of 16 emulated ranks
 
 Only one 8-GPU node is available. NCCL refuses two ranks on the same GPU inside one communicator,
