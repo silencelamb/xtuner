@@ -1,82 +1,255 @@
-# GLM-5.2-30B on 8×H200: legacy vs. decoupled EP/FSDP
+# GLM-5.2-30B on 8×H200: legacy vs. decoupled EP/FSDP (pt29 container)
 
-The target experiment from the task brief: the production-like GLM-5.2 30B (MTP) SFT profile,
-`EP=4` and `EP=8`, each with the legacy layout and with `DECOUPLE_EP_FSDP=1`. Expectation:
-lower memory, step time no worse than the legacy run at the same EP.
+Environment: torch 2.9.1+cu128, transformers 5.14.1, tilelang 0.1.11, cuDNN frontend 1.26 (DSA), DeepEP;
+NGC 25.03 base image, container `748c0954d2aa`. Every pair below differs **only** in `DECOUPLE_EP_FSDP`.
+All launches go through `examples/v1/config/sft_glm5p2.py` / `xtuner/v1/train/cli/sft.py` with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `DEBUG_SKIP_SAVE=1`, `SWAP_OPTIMIZER=0`, no CPU offload.
+`max_memory` / `reserved` are rank 0's `torch.cuda.max_memory_allocated / max_memory_reserved` in GiB
+(XTuner prints them as "GB" but divides by 1024³). Rank-0 step logs of every run are kept in
+`reports/glm52_pt29_logs/`.
 
-Settings (from `/workspace/xtuner/work_dirs/sft_glm5p2/his_gbs8_mb1_deepep`): `examples/v1/config/sft_glm5p2.py`,
-global batch 8 × 16K-token packs, `INTRA_LAYER_MICRO_BATCH=1`, DeepEP dispatcher, tile-wise fp8,
-`MODEL_COMPILE=1`, `XTUNER_DSA_TOPK_OFFLOAD=1`, AdamW lr 1e-6, 10 steps, `DEBUG_SKIP_SAVE=1`.
-Two deviations from the reference run, forced by today's environment (see `reports/decisions.md` D11):
-`SPARSE_MLA_BACKEND=tilelang` instead of `cudnn_dsa` (the installed cuDNN frontend has no DSA module), and
-`transformers==5.14.1` from an isolated `pip --target` directory. Both apply equally to all four runs, so the
-legacy-vs-decoupled comparison is like-for-like; absolute step times are not comparable with the
-`cudnn_dsa` reference (1.47 s/step).
+## 1. Production profile — the task's target experiment
 
-```bash
-DECOUPLE_EP_FSDP={0,1} EP_SIZE={4,8} SPARSE_MLA_BACKEND=tilelang DISPATCHER=deepep FP8=1 MODEL_COMPILE=1 \
-  INTRA_LAYER_MICRO_BATCH=1 TOTAL_STEP=10 PACK_MAX_LENGTH=16384 GLOBAL_BATCH_SIZE=8 ... \
-  torchrun --nproc-per-node 8 xtuner/v1/train/cli/sft.py --config examples/v1/config/sft_glm5p2.py
-```
+`GLM-5.2-30B` (MTP), global batch 8 × 16K-token packs, `INTRA_LAYER_MICRO_BATCH=1`, DeepEP, tile-wise fp8,
+`MODEL_COMPILE=1`, `SPARSE_MLA_BACKEND=cudnn_dsa`, `XTUNER_DSA_TOPK_OFFLOAD=1`, AdamW lr 1e-6, 10 steps
+(same recipe as `work_dirs/sft_glm5p2/his_gbs8_mb1_deepep`, whose reference run did 1.47 s/step at 99.4 GiB).
 
-## Summary
-
-| run | layout | mean step time s (steps 3-10) | max_memory GB | reserved GB | tgs (step 10) | llm loss (step 10) | mtp loss (step 10) |
+| run | exit | steady step time (s, steps 6-9) | max_memory (GiB) | reserved (GiB) | llm loss (last) | mtp loss (last) | grad_norm (step 1) |
 |---|---|---|---|---|---|---|---|
-| ep4_legacy | root (fsdp=2, ep=4): dense replicated 4× | 3.680 | 99.31 | 130.12 | 3641 | 9.906123 | 0.924151 |
-| ep4_decouple | root (1, efsdp=2, ep=4): dense FSDP-8, experts EP4 × FSDP-2 | 3.219 | 83.49 | 107.72 | 5420 | 9.905253 | 0.923514 |
-| ep8_legacy | root (fsdp=1, ep=8): dense replicated 8× | 15.532 | 120.46 | 133.90 | 1073 | 9.905459 | 0.923544 |
-| ep8_decouple | root (1, efsdp=1, ep=8): dense FSDP-8, experts pure EP8 | 3.197 | 78.61 | 97.66 | 5310 | 9.905190 | 0.923457 |
+| prod_ep4_legacy | exit=0 | 1.688 | 99.50 | 128.57 | 9.906144 | 0.923589 | 38.2750 |
+| prod_ep4_decouple | exit=0 | 1.658 | 83.49 | 104.95 | 9.905488 | 0.923488 | 38.1379 |
+| prod_ep8_legacy | exit=0 | 11.835 | 120.03 | 132.44 | 9.906259 | 0.923688 | 38.1843 |
+| prod_ep8_decouple | exit=0 | 1.636 | 76.32 | 94.44 | 9.905033 | 0.923618 | 38.1688 |
 
-### Per-step time (s)
-
-| step | ep4_legacy | ep4_decouple | ep8_legacy | ep8_decouple |
+| EP | legacy step / peak | decoupled step / peak | Δ step | Δ peak |
 |---|---|---|---|---|
-| 1 | 343.278 | 64.492 | 128.199 | 44.846 |
-| 2 | 7.061 | 5.130 | 16.411 | 4.900 |
-| 3 | 5.864 | 3.095 | 17.768 | 3.029 |
-| 4 | 3.325 | 4.529 | 14.988 | 3.054 |
-| 5 | 3.647 | 3.020 | 14.359 | 3.166 |
-| 6 | 3.029 | 3.022 | 16.807 | 3.333 |
-| 7 | 3.026 | 3.026 | 15.094 | 3.384 |
-| 8 | 3.024 | 3.022 | 16.485 | 3.267 |
-| 9 | 3.023 | 3.017 | 13.487 | 3.254 |
-| 10 | 4.500 | 3.022 | 15.269 | 3.085 |
+| 4 | 1.688 s / 99.50 GiB | 1.658 s / 83.49 GiB | -1.8% | -16.0 GiB (-16%) |
+| 8 | 11.835 s / 120.03 GiB | 1.636 s / 76.32 GiB | -86.2% | -43.7 GiB (-36%) |
 
-### Per-step llm loss and grad norm
+- **EP=4**: −16.0 GiB at the same step time — "显存减少、耗时与 EP=4 一致" ✅.
+- **EP=8**: −43.7 GiB; decoupled EP=8 (1.636 s) is the fastest configuration measured, slightly
+  faster than decoupled EP=4. Legacy EP=8 sits at 120.0 GiB allocated / 132.4 GiB reserved (the card has 140.4 GiB; torch can reserve ~133 GiB once CUDA context, NCCL/DeepEP buffers and kernel workspaces are taken) and runs
+  at 11.8 s/step for the whole 10-step run — see §2 for what happens over 40 steps.
+- Loss / grad-norm: the four runs agree step by step (llm loss within 1.5e-3, grad norm within 0.15 at step 1),
+  i.e. fp8 + DeepEP run-to-run noise (`reports/L3.md`).
 
-| step | ep4_legacy loss | ep4_decouple loss | ep8_legacy loss | ep8_decouple loss | ep4_legacy grad_norm | ep4_decouple grad_norm | ep8_legacy grad_norm | ep8_decouple grad_norm |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 12.242800 | 12.242373 | 12.242203 | 12.242203 | 38.2735 | 38.1383 | 38.1814 | 38.1707 |
-| 2 | 11.496803 | 11.495708 | 11.498307 | 11.497190 | 42.6749 | 42.4932 | 42.5134 | 42.5036 |
-| 3 | 11.353598 | 11.353171 | 11.354156 | 11.353515 | 37.0537 | 37.0256 | 37.0996 | 37.1438 |
-| 4 | 11.160206 | 11.160623 | 11.160633 | 11.160156 | 31.9895 | 31.9584 | 31.9928 | 31.9396 |
-| 5 | 10.935408 | 10.933840 | 10.935240 | 10.934601 | 34.3679 | 34.3845 | 34.3607 | 34.3290 |
-| 6 | 10.725193 | 10.723736 | 10.724656 | 10.724776 | 33.8208 | 33.7133 | 33.7792 | 33.7701 |
-| 7 | 10.522309 | 10.522133 | 10.522678 | 10.522328 | 32.3401 | 32.3253 | 32.2573 | 32.3094 |
-| 8 | 10.323658 | 10.322938 | 10.322732 | 10.322933 | 30.7218 | 30.7097 | 30.7327 | 30.7313 |
-| 9 | 10.051273 | 10.050630 | 10.051438 | 10.052432 | 29.5472 | 29.5462 | 29.5450 | 29.5401 |
-| 10 | 9.906123 | 9.905253 | 9.905459 | 9.905190 | 28.9784 | 28.9661 | 28.9714 | 28.9614 |
+## 2. Does legacy EP=8 recover? 40-step check
 
-## Findings
+| run | exit | steady step time (s, steps 20-40) | max_memory (GiB) | reserved (GiB) | llm loss (last) | mtp loss (last) | grad_norm (step 1) |
+|---|---|---|---|---|---|---|---|
+| prod_ep8_legacy_40 | exit=0 | 11.235 | 119.92 | 132.50 | 7.382744 | 0.655078 | 38.1843 |
+| prod_ep8_decouple_40 | exit=0 | 1.617 | 76.35 | 96.38 | 7.382671 | 0.655091 | 38.1686 |
 
-Steady-state step time (mean of steps 6–9, after the tilelang / torch.compile / adaptive_gemm JIT warm-up
-that dominates steps 1–5 and, for ep4_legacy, step 10):
+Per-step time (s):
 
-| EP | legacy | decoupled | Δ step time | legacy max_memory / reserved | decoupled max_memory / reserved | Δ max_memory |
+| step | prod_ep8_legacy_40 | prod_ep8_decouple_40 |
+|---|---|---|
+| 1 | 58.555 | 60.583 |
+| 2 | 11.440 | 3.486 |
+| 3 | 10.743 | 2.286 |
+| 4 | 11.209 | 1.638 |
+| 5 | 11.055 | 1.738 |
+| 6 | 12.611 | 1.603 |
+| 7 | 11.124 | 2.043 |
+| 8 | 11.607 | 1.597 |
+| 9 | 10.438 | 1.579 |
+| 10 | 11.407 | 1.591 |
+| 11 | 11.830 | 1.889 |
+| 12 | 12.933 | 1.589 |
+| 13 | 11.933 | 1.591 |
+| 14 | 13.396 | 1.595 |
+| 15 | 11.504 | 1.996 |
+| 16 | 11.240 | 1.601 |
+| 17 | 11.411 | 1.648 |
+| 18 | 12.900 | 1.587 |
+| 19 | 11.127 | 1.831 |
+| 20 | 10.707 | 1.588 |
+| 21 | 11.063 | 1.748 |
+| 22 | 11.004 | 1.579 |
+| 23 | 11.521 | 1.598 |
+| 24 | 11.347 | 1.582 |
+| 25 | 12.173 | 1.577 |
+| 26 | 11.202 | 1.590 |
+| 27 | 10.671 | 1.573 |
+| 28 | 11.364 | 1.591 |
+| 29 | 11.079 | 2.149 |
+| 30 | 11.304 | 1.579 |
+| 31 | 10.769 | 1.580 |
+| 32 | 11.136 | 1.572 |
+| 33 | 10.906 | 1.582 |
+| 34 | 11.347 | 1.572 |
+| 35 | 10.862 | 1.580 |
+| 36 | 10.704 | 1.577 |
+| 37 | 10.466 | 1.602 |
+| 38 | 11.708 | 1.579 |
+| 39 | 12.846 | 1.585 |
+| 40 | 11.757 | 1.577 |
+
+Legacy EP=8 stays at 10.4–13.4 s for all 40 steps (mean 11.24 s over steps 20–40) versus 1.62 s decoupled; step-40
+loss is identical (7.38274 vs 7.38267). The colleague's 200-step legacy EP=4 parity log shows a related pattern at
+118 GiB: 13–15 s/step for the first ~50 steps, then 2.43 s from step 55 on, while its legacy EP=2 run (126.9 GiB)
+never drops below 13 s in 200 steps.
+
+What separates fast from slow runs is the **reserved** peak, not the allocated peak:
+
+| run | allocated peak (GiB) | reserved peak (GiB) | step time |
+|---|---|---|---|
+| prod gbs16 EP4 decoupled | 89.1 | 109.9 | fast |
+| prod-like mb1 decoupled | 96.5 | 119.0 | fast |
+| parity EP4 decoupled | 101.5 | 123.1 | fast (2.75 s) |
+| prod-like mb2 decoupled | 107.1 | 132.5 | slow (15.0 s) |
+| prod gbs16 EP4 legacy | 108.2 | 132.0 | slow (12.4 s) |
+| prod-like mb1 legacy | 111.1 | 132.5 | slow (19.2 s) |
+| parity EP4 legacy | 117.4 | 132.3 | slow (16.6 s) |
+| prod EP8 legacy | 120.0 | 132.5 | slow (11.2 s) |
+
+Every slow run has its reserved peak pinned at 132.0–132.5 GiB, i.e. at the ceiling the caching allocator can
+obtain (140.4 GiB minus non-torch usage); every fast run stays ≤ 123 GiB. The 10–25 GiB between allocated and
+reserved is cache/fragmentation, so allocated peaks of ~102–108 GiB are a grey zone rather than a threshold.
+Our reading — an inference consistent with all runs, not yet confirmed with `torch.cuda.memory_stats()`
+counters (`num_alloc_retries`, `num_device_free`) — is that once reserved hits the ceiling the caching allocator
+falls back to its release-and-retry path (unmapping cached `expandable_segments` pages, device sync, re-map) on
+almost every step; whether it ever settles depends on how much slack remains (the colleague's EP4 legacy did
+after ~50 steps, its EP2 legacy and our EP8 legacy did not). The decoupled runs keep 17–45 GiB of headroom and
+are at steady state from step 2.
+
+## 3. Production profile, `GLOBAL_BATCH_SIZE=16`, EP=4, MB1, DeepEP (10 steps)
+
+Two packs per rank per step (gradient accumulation 2), everything else as in §1.
+
+| run | exit | steady step time (s, steps 6-9) | max_memory (GiB) | reserved (GiB) | llm loss (last) | mtp loss (last) | grad_norm (step 1) |
+|---|---|---|---|---|---|---|---|
+| prod_gbs16_ep4_legacy | exit=0 | 12.369 | 108.19 | 132.01 | 9.878106 | 0.926278 | 38.0667 |
+| prod_gbs16_ep4_decouple | exit=0 | 3.358 | 89.11 | 109.93 | 9.877830 | 0.926023 | 37.9339 |
+
+- step time 12.369 → 3.358 s, peak 108.19 → 89.11 GiB (-19.1 GiB). The decoupled step
+  time is 2× the GBS=8 step (1.66 s), as expected for two micro-batches; legacy at 108.2 GiB is again in
+  the slow allocator regime.
+
+## 4. Comparison with AutoModel (colleague's EP=4 parity recipe)
+
+Recipe from `/workspace/xtuner/GLM5.2/notes/training/xtuner/glm5.2_readme.md` §2/§4: `GLM-5.2-30B-NoMTP`, Alpaca,
+global batch 8 × 16K packs, MB1, DeepEP, `SPARSE_MLA_BACKEND=tilelang`, bf16 (no fp8), no compile, no
+offload, activation recompute, AdamW constant lr 1e-6. 20 steps here (memory peaks in the first steps).
+
+| run | exit | steady step time (s, steps 10-20) | max_memory (GiB) | reserved (GiB) | llm loss (last) | grad_norm (step 1) |
 |---|---|---|---|---|---|---|
-| 4 | 3.025 s | 3.022 s | -0.1% | 99.3 / 130.1 GB | 83.5 / 107.7 GB | -15.8 GB (-16%) |
-| 8 | 15.468 s | 3.309 s | -78.6% | 120.5 / 133.9 GB | 78.6 / 97.7 GB | -41.8 GB (-35%) |
+| parity_ep4_legacy | exit=0 | 16.640 | 117.35 | 132.34 | 9.192273 | 32.7078 |
+| parity_ep4_decouple | exit=0 | 2.754 | 101.45 | 123.05 | 9.192635 | 32.7005 |
 
-- **EP=4, decoupled (efsdp=2)**: peak memory drops by 15.8 GB per rank at the same
-  steady-state step time (3.02 vs 3.03 s) — the "显存减少、耗时与 EP=4 一致" target.
-- **EP=8, decoupled (efsdp=1)**: peak memory drops by 41.8 GB per rank. The legacy EP=8 layout
-  replicates every dense parameter (attention / DSA projections, shared experts, embeddings, lm_head, MTP
-  heads) 8× and drives the allocator to 133.9 GB reserved of 143 GB, where `expandable_segments`
-  keeps remapping and every step takes 13–18 s; the decoupled run stays at 97.7 GB reserved and
-  trains at 3.31 s/step, the same speed as EP=4. On this 8-GPU profile the legacy EP=8
-  configuration is effectively unusable, EP=8 + decoupling is.
-- **Numerics**: the four loss curves and grad norms agree step by step to ≤ 1.5e-3 absolute (fp8 +
-  DeepEP run-to-run noise, cf. `reports/L3.md`); the step-1 loss of ep8_legacy and ep8_decouple is identical.
-- Absolute step times here use the tilelang sparse-MLA backend and include no activation offload; they are
-  not comparable with the 1.47 s/step `cudnn_dsa` reference, but the legacy-vs-decoupled deltas are.
+| run | peak memory (GiB) | step time |
+|---|---|---|
+| AutoModel EP4 (colleague, HybridEP, 200 steps) | 83.79 | 2.589 s (updates 60–200) |
+| XTuner EP4 legacy (colleague, 200 steps) | 118.00 | 13-15 s (steps 1–50) → 2.43 s (steps 55–200) |
+| XTuner EP4 legacy (this run, 20 steps) | 117.35 | 16.640 s (steps 10–20) |
+| XTuner EP4 **decoupled** (this run, 20 steps) | **101.45** | **2.754 s** (steps 10–20, steady from step 3) |
+
+- Decoupling closes 47% of the XTuner–AutoModel peak-memory gap
+  (117.3 → 101.5 GiB vs AutoModel 83.79 GiB): the remaining 17.7 GiB is not
+  parameter/optimizer replication any more (AutoModel's `ep_shard` layout is the same dp2ep layout as ours).
+  Candidates are activation/workspace memory (DeepEP buffers, tilelang sparse-MLA workspace, loss chunking)
+  and the expert GEMM implementation — the colleague's CUTLASS group-GEMM A/B removed another 19 GiB from the
+  legacy EP4 run (117.87 → 98.70 GiB) and is orthogonal to this change.
+- Step time: decoupled 2.75 s vs AutoModel 2.59 s and the colleague's late-phase legacy 2.43 s.
+- llm loss after 20 steps: 9.1923 (legacy) vs 9.1926 (decoupled).
+
+## 5. Colleague's prod-like profile: EP=2, SP=2, DeepEP, activation offload, compile, MB1 / MB2
+
+Recipe from the readme §7 (`sft_glm52_prodlike_ep2_sp2_activation_offload_compile.sh`): NoMTP, bf16, tilelang,
+`XTUNER_ACTIVATION_OFFLOAD=1`, `LOSS_CHUNK_SIZE=1024`, `XTUNER_GC_ENABLE=1`, constant lr. First run of
+`decouple_ep_fsdp` together with sequence parallel. 20 steps.
+
+| run | exit | steady step time (s, steps 10-20) | max_memory (GiB) | reserved (GiB) | llm loss (last) | grad_norm (step 1) |
+|---|---|---|---|---|---|---|
+| prodlike_ep2sp2_mb1_legacy | exit=0 | 19.223 | 111.08 | 132.49 | 9.178407 | 32.5355 |
+| prodlike_ep2sp2_mb1_decouple | exit=0 | 3.163 | 96.51 | 119.00 | 9.178430 | 32.5248 |
+| prodlike_ep2sp2_mb2_legacy | exit=0 | 18.951 | 115.96 | 132.40 | 9.177890 | 32.5354 |
+| prodlike_ep2sp2_mb2_decouple | exit=0 | 14.965 | 107.05 | 132.49 | 9.178247 | 32.5156 |
+
+| MB | legacy step / peak | decoupled step / peak | Δ peak |
+|---|---|---|---|
+| 1 | 19.223 s / 111.08 GiB | 3.163 s / 96.51 GiB | -14.6 GiB |
+| 2 | 18.951 s / 115.96 GiB | 14.965 s / 107.05 GiB | -8.9 GiB |
+
+- MB1: decoupling removes 14.6 GiB and takes the run out of the slow allocator regime (19.2 → 3.16 s/step);
+  this is also the first run of `decouple_ep_fsdp` together with sequence parallel (SP=2) — it works unchanged.
+- MB2: two micro-batches in flight double the live activations; decoupling still removes 8.9 GiB but the run
+  stays pinned at 132.5 GiB reserved, so it only improves from 19.0 to 15.0 s/step. On this 30B / 16K-pack
+  profile MB2 is activation-bound and needs more than parameter de-replication to be fast on one node.
+- Loss curves of all four agree step by step (9.1784 vs 9.1784 at step 20).
+
+## 6. Per-step llm loss (all runs)
+
+| step | prod_ep4_legacy | prod_ep4_decouple | prod_ep8_legacy | prod_ep8_decouple | prod_gbs16_ep4_legacy | prod_gbs16_ep4_decouple |
+|---|---|---|---|---|---|---|
+| 1 | 12.242835 | 12.242374 | 12.242205 | 12.242205 | 12.236732 | 12.236374 |
+| 2 | 11.496573 | 11.495951 | 11.497021 | 11.497888 | 11.486389 | 11.486962 |
+| 3 | 11.353387 | 11.354423 | 11.353814 | 11.353219 | 11.337647 | 11.337610 |
+| 4 | 11.160427 | 11.160503 | 11.160210 | 11.160748 | 11.163484 | 11.162803 |
+| 5 | 10.934574 | 10.933951 | 10.933998 | 10.934554 | 10.955031 | 10.953431 |
+| 6 | 10.724062 | 10.724489 | 10.724340 | 10.724806 | 10.746705 | 10.747047 |
+| 7 | 10.523461 | 10.521789 | 10.522464 | 10.522381 | 10.527714 | 10.527598 |
+| 8 | 10.323409 | 10.323653 | 10.323524 | 10.323934 | 10.328103 | 10.327041 |
+| 9 | 10.050714 | 10.050805 | 10.050767 | 10.051491 | 10.048573 | 10.048362 |
+| 10 | 9.906144 | 9.905488 | 9.906259 | 9.905033 | 9.878106 | 9.877830 |
+
+| step | parity_ep4_legacy | parity_ep4_decouple | prodlike_ep2sp2_mb1_legacy | prodlike_ep2sp2_mb1_decouple | prodlike_ep2sp2_mb2_legacy | prodlike_ep2sp2_mb2_decouple |
+|---|---|---|---|---|---|---|
+| 1 | 12.048020 | 12.048020 | 12.015297 | 12.015297 | 12.015230 | 12.015260 |
+| 2 | 12.024372 | 12.024330 | 12.004551 | 12.004889 | 12.004640 | 12.004749 |
+| 3 | 11.968227 | 11.968078 | 11.974769 | 11.974870 | 11.974946 | 11.974766 |
+| 4 | 11.935795 | 11.935991 | 11.956466 | 11.956565 | 11.956635 | 11.956882 |
+| 5 | 11.762895 | 11.762611 | 11.791142 | 11.791558 | 11.791435 | 11.791679 |
+| 6 | 11.726269 | 11.726021 | 11.746720 | 11.747422 | 11.746029 | 11.747211 |
+| 7 | 11.691442 | 11.692036 | 11.679165 | 11.679321 | 11.678986 | 11.679071 |
+| 8 | 11.670940 | 11.671287 | 11.669518 | 11.669571 | 11.669342 | 11.669516 |
+| 9 | 11.114158 | 11.114318 | 11.128633 | 11.128882 | 11.128363 | 11.128780 |
+| 10 | 11.120523 | 11.120468 | 11.069838 | 11.069673 | 11.068581 | 11.069795 |
+| 11 | 11.031364 | 11.031272 | 11.003869 | 11.004610 | 11.005125 | 11.004539 |
+| 12 | 11.012856 | 11.013029 | 11.005733 | 11.005695 | 11.005744 | 11.006051 |
+| 13 | 10.837400 | 10.838067 | 10.846592 | 10.847128 | 10.846694 | 10.846529 |
+| 14 | 10.809042 | 10.809765 | 10.808216 | 10.809036 | 10.809648 | 10.809333 |
+| 15 | 10.775974 | 10.776084 | 10.754548 | 10.754716 | 10.755053 | 10.754559 |
+| 16 | 10.755434 | 10.755795 | 10.715282 | 10.715774 | 10.716381 | 10.715880 |
+| 17 | 9.354899 | 9.354802 | 9.326880 | 9.326507 | 9.326110 | 9.326167 |
+| 18 | 9.289428 | 9.289060 | 9.309678 | 9.309234 | 9.309449 | 9.309461 |
+| 19 | 9.251739 | 9.251347 | 9.229165 | 9.229153 | 9.228951 | 9.228942 |
+| 20 | 9.192273 | 9.192635 | 9.178407 | 9.178430 | 9.177890 | 9.178247 |
+
+## 7. Per-step time (s)
+
+| step | prod_ep4_legacy | prod_ep4_decouple | prod_ep8_legacy | prod_ep8_decouple | prod_gbs16_ep4_legacy | prod_gbs16_ep4_decouple |
+|---|---|---|---|---|---|---|
+| 1 | 61.615 | 71.797 | 135.281 | 59.375 | 61.494 | 61.261 |
+| 2 | 3.928 | 3.895 | 11.946 | 3.053 | 17.459 | 6.021 |
+| 3 | 1.842 | 1.643 | 13.227 | 2.367 | 11.758 | 3.358 |
+| 4 | 1.651 | 1.836 | 11.846 | 1.637 | 11.608 | 3.594 |
+| 5 | 1.790 | 1.644 | 13.804 | 1.986 | 16.748 | 3.220 |
+| 6 | 1.649 | 1.704 | 11.950 | 1.603 | 13.620 | 3.308 |
+| 7 | 1.806 | 1.643 | 10.998 | 1.768 | 11.402 | 3.219 |
+| 8 | 1.649 | 1.641 | 13.293 | 1.594 | 10.916 | 3.683 |
+| 9 | 1.647 | 1.643 | 11.099 | 1.581 | 13.539 | 3.222 |
+| 10 | 1.648 | 1.645 | 11.222 | 1.599 | 11.836 | 3.760 |
+
+| step | parity_ep4_legacy | parity_ep4_decouple | prodlike_ep2sp2_mb1_legacy | prodlike_ep2sp2_mb1_decouple | prodlike_ep2sp2_mb2_legacy | prodlike_ep2sp2_mb2_decouple |
+|---|---|---|---|---|---|---|
+| 1 | 84.720 | 39.825 | 82.360 | 65.315 | 65.602 | 75.303 |
+| 2 | 13.772 | 3.724 | 16.090 | 7.545 | 15.119 | 12.515 |
+| 3 | 16.907 | 2.714 | 18.614 | 4.200 | 21.344 | 18.062 |
+| 4 | 16.662 | 2.722 | 20.069 | 3.120 | 18.238 | 11.452 |
+| 5 | 16.265 | 3.364 | 17.767 | 3.098 | 21.383 | 16.644 |
+| 6 | 16.986 | 2.721 | 17.854 | 3.459 | 20.779 | 14.338 |
+| 7 | 16.961 | 2.708 | 16.477 | 3.095 | 21.882 | 14.867 |
+| 8 | 14.616 | 2.718 | 20.274 | 3.102 | 18.259 | 13.941 |
+| 9 | 14.872 | 2.708 | 19.073 | 4.176 | 21.811 | 14.294 |
+| 10 | 15.180 | 2.710 | 18.292 | 3.096 | 18.539 | 17.135 |
+| 11 | 17.102 | 3.052 | 19.832 | 3.103 | 18.754 | 15.624 |
+| 12 | 17.878 | 2.876 | 19.761 | 3.093 | 19.049 | 13.664 |
+| 13 | 17.971 | 2.720 | 17.453 | 3.098 | 19.818 | 13.644 |
+| 14 | 15.825 | 2.700 | 21.058 | 3.095 | 17.910 | 14.394 |
+| 15 | 18.895 | 2.705 | 19.168 | 3.838 | 19.142 | 15.443 |
+| 16 | 16.270 | 2.701 | 18.061 | 3.093 | 17.927 | 13.760 |
+| 17 | 15.296 | 2.708 | 20.332 | 3.092 | 19.074 | 17.417 |
+| 18 | 16.353 | 2.712 | 20.494 | 3.097 | 20.129 | 15.768 |
+| 19 | 15.072 | 2.703 | 18.091 | 3.095 | 15.710 | 14.908 |
+| 20 | 17.195 | 2.704 | 18.910 | 3.094 | 22.414 | 12.856 |
