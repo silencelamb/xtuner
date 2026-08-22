@@ -154,8 +154,8 @@ offload, activation recompute, AdamW constant lr 1e-6. 20 steps here (memory pea
 
 - Decoupling closes about half of the XTuner–AutoModel peak-memory gap on this recipe (117.4 → 101.5 GiB vs
   AutoModel 83.79 GiB). The remaining 17.7 GiB is not parameter/optimizer replication (AutoModel's `ep_shard`
-  layout is the same dp2ep layout as ours); §8.1 shows it is the eager Triton grouped-GEMM path's persistent
-  memory, and that decoupling + CUTLASS group GEMM lands at 82.25 GiB — at AutoModel's level.
+  layout is the same dp2ep layout as ours); §8.2/8.3 show it is first-step Triton-autotune garbage kept alive by XTuner's disabled GC; with
+  `XTUNER_GC_ENABLE=1` (or CUTLASS) the decoupled run lands at 82.2 GiB — at AutoModel's level.
 - Step time: decoupled 2.75 s vs AutoModel 2.59 s and the colleague's late-phase legacy 2.43 s.
 - llm loss after 20 steps: 9.1923 (legacy) vs 9.1926 (decoupled).
 
@@ -235,17 +235,66 @@ A/B on this branch.
 | EP4 **decoupled, CUTLASS** | **45.73** | **82.25** | 36.52 | 103.30 | 0.0 | **2.73 s** | 9.192413 |
 | AutoModel EP4 (colleague) | — | 83.79 | — | — | — | 2.59 s | — |
 
-- On this recipe CUTLASS reproduces the colleague's result: −19.0 GiB, and the probe shows it is entirely
-  **resident** memory (the Triton grouped-GEMM path keeps ~19 GiB of persistent state that CUTLASS does not);
-  the transient part (peak − resident ≈ 36.5 GiB) is identical in all four runs. In the compiled + activation-
-  offload prod-like recipe of §8 the same switch changes nothing, so that persistent state is specific to the
-  eager Triton path.
-- The two savings are additive (decoupling: −15.5 GiB resident, CUTLASS: −19.0 GiB resident) because they
-  remove different things — EP-replicated dense parameter/optimizer state vs. Triton-path buffers.
-- **Decoupled + CUTLASS: 82.25 GiB peak, 2.73 s/step — at AutoModel's 83.79 GiB / 2.59 s.** The XTuner–AutoModel
-  memory gap on the EP4 parity recipe is closed; what remains is a ~5% step-time difference.
-- Legacy + CUTLASS (97.96 GiB, 128 GiB reserved) also escapes the allocator ceiling in this recipe, which is
-  why the colleague measured 2.41 s for it; legacy + Triton at 116.9 GiB does not (3.2 retries/step).
+- On this recipe the switch reproduces the colleague's −19 GiB, and the probe shows it is entirely
+  **resident** memory; the transient part (peak − resident ≈ 36.5 GiB) is identical in all four runs.
+
+### 8.2 It is not the kernel — it is Python's cyclic GC
+
+XTuner calls `gc.disable()` at startup unless `XTUNER_GC_ENABLE=1` (`trainer.py::_setup_env`). The parity
+recipe leaves it disabled; the prod-like recipe of §8 sets it to 1 — which is exactly the recipe where CUTLASS
+made no difference. Re-running the Triton path with the collector enabled:
+
+| run (parity EP4, 20 steps) | resident after step (GiB) | peak alloc (GiB) | reserved peak (GiB) | step time (steps 10–20) |
+|---|---|---|---|---|
+| decoupled, Triton, GC off (default) | 64.77 | 101.32 | 122.72 | 2.79 s |
+| decoupled, Triton, **`XTUNER_GC_ENABLE=1`** | **45.73** | **82.23** | 103.95 | 2.74 s |
+| decoupled, CUTLASS, GC off | 45.73 | 82.25 | 103.30 | 2.73 s |
+| legacy, Triton, GC off | 80.28 | 116.90 | 132.33 | 16.60 s |
+| legacy, Triton, `XTUNER_GC_ENABLE=1` | 61.24 | 97.89 | 128.67 | 2.89 s |
+| legacy, CUTLASS, GC off | 61.24 | 97.96 | 127.98 | 2.72 s |
+
+Enabling the collector gives byte-identical resident memory to CUTLASS, so the 19 GiB are tensors pinned by
+reference cycles that only the cyclic collector can free. Section 8.3 identifies them.
+
+### 8.3 Root cause: Triton autotune exceptions pin the first step's tensors
+
+Probe (`MEMPROBE_GC_DEBUG=1`, Triton path, GC disabled, after step 3): `gc.collect()` with `DEBUG_SAVEALL`
+finds **25,728 unreachable objects holding 93 CUDA tensors = 28.6 GiB**. Their types: `traceback` (280),
+`frame` (399), `FrameSummary` (3689), `cell` (4784), `function` (3183), `functools.partial`,
+`torch._subclasses.fake_tensor.FakeTensorMode` (164), and **40 × `triton.runtime.errors.OutOfResources` with
+40 × `triton.backends.nvidia.compiler.CUDAOptions`**. Every `OutOfResources` carries the same traceback:
+
+```
+triton/runtime/autotuner.py:_bench > testing.py:do_bench > autotuner.py:kernel_call
+  > jit.py:run > compiler.py:launch_metadata > compiler.py:_init_handles > compiler.py:raise_
+```
+
+i.e. the grouped-GEMM **autotune**: configurations that exceed shared memory / registers raise
+`OutOfResources`, Triton catches them and moves on, but the exception objects survive in a reference cycle
+(exception → traceback → `_bench` frame → `args` / closure cells → the kernel argument tensors: the dispatched
+activations, the unsharded EP-local expert weights, the dW outputs of that call). Autotuning runs once per
+weight shape (`@triton.autotune(key=["N","K"])` / `key=["M","N"]` are weight dimensions), so the cycle is
+created **once, in step 1**, and then stays: constant 19 GiB resident, never growing — which is exactly what
+the per-step probes show. XTuner disables Python's cyclic GC at startup (`gc.disable()` unless
+`XTUNER_GC_ENABLE=1`) and only calls `gc.collect()` every 50 steps, so the garbage lives for 50 steps at a
+time. With the collector enabled it is reclaimed right after the autotune; the CUTLASS path has no autotune
+and therefore no such garbage; the compiled prod-like recipe (§8) had `XTUNER_GC_ENABLE=1` set, which is why
+CUTLASS changed nothing there.
+
+Consequences:
+
+- The colleague's "CUTLASS saves 19 GiB" is a GC artefact of the Triton autotune, not a kernel property; the
+  same saving comes from `XTUNER_GC_ENABLE=1` or from a single `gc.collect()` after the first step.
+- A cheap, safe fix on the XTuner side is to collect once after step 1 (e.g. `if self.cur_step == 1 or
+  self.cur_step % 50 == 0: gc.collect()` in the train loop) so autotune garbage never survives; it is a
+  separate one-line PR, not part of the decoupling change.
+- Under the allocator-ceiling behaviour of §2 this garbage is also what pushed legacy Triton EP4 over the edge
+  (117 GiB → 3.2 alloc retries / step), so the colleague's 13–15 s/step phase for the first 50 steps is the
+  autotune garbage being held until the `cur_step % 50` collection at step 50 — matching the jump to 2.43 s
+  at step 55 in their log.
+
+So the right comparison with AutoModel at EP4 is **decoupled + `XTUNER_GC_ENABLE=1` (or CUTLASS): 82.2 GiB /
+2.74 s vs AutoModel 83.79 GiB / 2.59 s** — parity reached without changing the expert GEMM kernel.
 
 ## 6. Per-step llm loss (all runs)
 
