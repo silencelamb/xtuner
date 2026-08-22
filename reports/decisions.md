@@ -127,3 +127,15 @@ and from the `ep=1` FSDP-8 baseline.
   `pyproject.toml` pins `transformers==5.14.1`. GLM-5.2 runs use an isolated
   `pip install --no-deps --target <dir> transformers==5.14.1 huggingface_hub==1.5.0 "safetensors>=0.8" "regex>=2025.10.22"`
   prepended to `PYTHONPATH`; the global environment is left untouched.
+
+## D12. Re-validation in the intended `pt29` container
+
+The first pass of every report was produced in a container started from the NGC 25.03 / torch
+2.8.0 image of another project (same NFS home, same hostname — only `/usr/local` differed), which
+is also why `transformers`/`tilelang`/cuDNN-DSA had to be improvised (D11). All L0–L3 runs, the
+fp8 numerics, the legacy regression and the GLM-5.2 runs were then repeated unchanged in the
+`pt29` container (torch 2.9.1+cu128, transformers 5.14.1, tilelang 0.1.11, cuDNN frontend 1.26 with
+DSA, DeepEP). `reports/L1.md`, `L2.md`, `L3.md` and `GLM52.md` now carry the torch-2.9 numbers;
+conclusions are unchanged. Note for memory comparisons: XTuner's logged `max_memory` is
+`max_memory_allocated() / 1024**3`, i.e. GiB despite the "GB" label, so it is directly comparable
+with AutoModel's `mem … GiB`.
