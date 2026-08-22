@@ -106,12 +106,20 @@ What separates fast from slow runs is the **reserved** peak, not the allocated p
 Every slow run has its reserved peak pinned at 132.0–132.5 GiB, i.e. at the ceiling the caching allocator can
 obtain (140.4 GiB minus non-torch usage); every fast run stays ≤ 123 GiB. The 10–25 GiB between allocated and
 reserved is cache/fragmentation, so allocated peaks of ~102–108 GiB are a grey zone rather than a threshold.
-Our reading — an inference consistent with all runs, not yet confirmed with `torch.cuda.memory_stats()`
-counters (`num_alloc_retries`, `num_device_free`) — is that once reserved hits the ceiling the caching allocator
-falls back to its release-and-retry path (unmapping cached `expandable_segments` pages, device sync, re-map) on
-almost every step; whether it ever settles depends on how much slack remains (the colleague's EP4 legacy did
-after ~50 steps, its EP2 legacy and our EP8 legacy did not). The decoupled runs keep 17–45 GiB of headroom and
-are at steady state from step 2.
+This was then measured directly with a wrapper around `Trainer._log_step` that prints
+`torch.cuda.memory_stats()` counters and the resident memory right after the optimizer step
+(`reports/glm52_pt29_logs/probe_*.rank0.log`, `[MEMPROBE]` lines):
+
+| run (10 steps, steps 2–10) | resident after step (GiB) | peak alloc (GiB) | reserved peak (GiB) | `num_alloc_retries` / step | `num_device_free` / step | `num_sync_all_streams` / step | step time |
+|---|---|---|---|---|---|---|---|
+| prod EP8 legacy | 82.83 | 118.96 | 132.50 | 2.0 | 24.2 | 2.0 | 11.11 s |
+| prod EP8 decoupled | 45.87 | 75.76 | 95.89 | 0.0 | 0.0 | 0.0 | 1.82 s |
+
+Every legacy step hits the caching allocator's release-and-retry path twice (`num_alloc_retries`), each time
+freeing ~12 cached segments back to the driver (`num_device_free`) after a full-device synchronization
+(`num_sync_all_streams`); the decoupled run never does. The same signature appears in every slow run below
+(1.5–2.5 retries/step) and in none of the fast ones. So the slowdown is the allocator thrashing against the
+reserved ceiling, not the model or the communication pattern.
 
 ## 3. Production profile, `GLOBAL_BATCH_SIZE=16`, EP=4, MB1, DeepEP (10 steps)
 
@@ -144,12 +152,10 @@ offload, activation recompute, AdamW constant lr 1e-6. 20 steps here (memory pea
 | XTuner EP4 legacy (this run, 20 steps) | 117.35 | 16.640 s (steps 10–20) |
 | XTuner EP4 **decoupled** (this run, 20 steps) | **101.45** | **2.754 s** (steps 10–20, steady from step 3) |
 
-- Decoupling closes 47% of the XTuner–AutoModel peak-memory gap
-  (117.3 → 101.5 GiB vs AutoModel 83.79 GiB): the remaining 17.7 GiB is not
-  parameter/optimizer replication any more (AutoModel's `ep_shard` layout is the same dp2ep layout as ours).
-  Candidates are activation/workspace memory (DeepEP buffers, tilelang sparse-MLA workspace, loss chunking)
-  and the expert GEMM implementation — the colleague's CUTLASS group-GEMM A/B removed another 19 GiB from the
-  legacy EP4 run (117.87 → 98.70 GiB) and is orthogonal to this change.
+- Decoupling closes about half of the XTuner–AutoModel peak-memory gap on this recipe (117.4 → 101.5 GiB vs
+  AutoModel 83.79 GiB). The remaining 17.7 GiB is not parameter/optimizer replication (AutoModel's `ep_shard`
+  layout is the same dp2ep layout as ours); §8.1 shows it is the eager Triton grouped-GEMM path's persistent
+  memory, and that decoupling + CUTLASS group GEMM lands at 82.25 GiB — at AutoModel's level.
 - Step time: decoupled 2.75 s vs AutoModel 2.59 s and the colleague's late-phase legacy 2.43 s.
 - llm loss after 20 steps: 9.1923 (legacy) vs 9.1926 (decoupled).
 
@@ -171,12 +177,75 @@ Recipe from the readme §7 (`sft_glm52_prodlike_ep2_sp2_activation_offload_compi
 | 1 | 19.223 s / 111.08 GiB | 3.163 s / 96.51 GiB | -14.6 GiB |
 | 2 | 18.951 s / 115.96 GiB | 14.965 s / 107.05 GiB | -8.9 GiB |
 
+Resident (after optimizer step) vs. peak memory from the probe runs (steps 10–20):
+
+| run | resident after step (GiB) | peak alloc (GiB) | peak − resident (GiB) | reserved peak (GiB) | alloc retries / step | step time |
+|---|---|---|---|---|---|---|
+| MB1 legacy | 51.09 | 111.02 | 59.93 | 132.45 | 1.8 | 18.46 s |
+| MB1 decoupled | 45.92 | 96.33 | 50.41 | 119.78 | 0.0 | 3.14 s |
+| MB2 legacy | 51.28 | 115.93 | 64.65 | 132.48 | 2.5 | 19.51 s |
+| MB2 decoupled | 46.11 | 106.99 | 60.88 | 132.47 | 1.5 | 15.22 s |
+
+Why MB2 saves only 8.9 GiB while MB1 saves 14.6 GiB:
+
+- The **resident** saving is the same in both: 5.2 GiB. It is exactly what de-replication predicts. Let *D*
+  be the per-model dense state (fp32 master + AdamW moments + sharded working copies). Legacy EP=*e* holds
+  *D*/(8/*e*) per rank, decoupled holds *D*/8, so the saving is *D*(*e*−1)/8. The probes give
+  *D* ≈ 42 GiB: EP=2 → 5.3 GiB (measured 5.2), EP=4 → 15.8 GiB (measured 16.0 prod, 15.9 parity), EP=8 →
+  36.9 GiB (measured resident 82.83 → 45.87 = 36.96). The model fits all three.
+- The rest of the saving is in the **transient** part (peak − resident): −9.5 GiB for MB1 but only −3.8 GiB
+  for MB2. With two micro-batches in flight the activation peak is ~5 GiB higher and dominates the peak
+  moment, so less of the legacy-only transient overhead (larger fp32 dense-gradient shards alive during
+  backward, the EP all-reduce of those gradients) is exposed at the peak. Attributing the transient delta
+  exactly would need a `torch.cuda.memory._snapshot`, which was not taken.
+- Net effect: MB2 decoupled still lands at 107 GiB allocated / 132.5 GiB reserved — on the allocator ceiling
+  (1.5 retries/step) — hence 15 s/step instead of ~3 s.
+
 - MB1: decoupling removes 14.6 GiB and takes the run out of the slow allocator regime (19.2 → 3.16 s/step);
   this is also the first run of `decouple_ep_fsdp` together with sequence parallel (SP=2) — it works unchanged.
-- MB2: two micro-batches in flight double the live activations; decoupling still removes 8.9 GiB but the run
-  stays pinned at 132.5 GiB reserved, so it only improves from 19.0 to 15.0 s/step. On this 30B / 16K-pack
-  profile MB2 is activation-bound and needs more than parameter de-replication to be fast on one node.
+- MB2: decoupling removes 8.9 GiB but the run stays pinned at 132.5 GiB reserved, so it only improves from
+  19.0 to 15.0 s/step. On this 30B / 16K-pack profile MB2 is activation-bound and needs more than parameter
+  de-replication to be fast on one node.
 - Loss curves of all four agree step by step (9.1784 vs 9.1784 at step 20).
+
+## 8. CUTLASS group GEMM on top of decoupling
+
+`XTUNER_USE_CUTLASS_GROUP_GEMM=1` (the banner `Using cutlass group gemm` is printed by all 8 ranks) on the
+prod-like EP2/SP2 MB1 recipe of §5, 20 steps, probe wrapper enabled:
+
+| run | resident after step (GiB) | peak alloc (GiB) | reserved peak (GiB) | alloc retries / step | step time (steps 10–20) | llm loss (step 20) |
+|---|---|---|---|---|---|---|
+| MB1 legacy, Triton | 51.09 | 111.02 | 132.45 | 1.8 | 18.46 s | 9.178551 |
+| MB1 legacy, CUTLASS | 51.09 | 111.01 | 132.40 | 2.2 | 17.29 s | 9.178483 |
+| MB1 decoupled, Triton | 45.92 | 96.33 | 119.78 | 0.0 | 3.14 s | 9.177789 |
+| MB1 decoupled, CUTLASS | 45.92 | 96.37 | 119.48 | 0.0 | 3.22 s | 9.178550 |
+
+On this recipe CUTLASS changes neither the resident nor the peak memory (±0.05 GiB) and the step time by
+≤ 2.5%; it is orthogonal to decoupling but brings no additional saving here. The colleague's −19 GiB CUTLASS
+result was measured on the EP4 parity recipe (no SP, no activation offload, no compile); §8.1 repeats that
+A/B on this branch.
+
+### 8.1 CUTLASS on the AutoModel-parity EP4 recipe (§4 settings, 20 steps, probe wrapper)
+
+| run | resident after step (GiB) | peak alloc (GiB) | peak − resident (GiB) | reserved peak (GiB) | alloc retries / step | step time (steps 10–20) | llm loss (step 20) |
+|---|---|---|---|---|---|---|---|
+| EP4 legacy, Triton | 80.28 | 116.90 | 36.62 | 132.33 | 3.2 | 16.60 s | 9.192291 |
+| EP4 legacy, CUTLASS | 61.24 | 97.96 | 36.72 | 127.98 | 0.0 | 2.72 s | 9.191978 |
+| EP4 decoupled, Triton | 64.77 | 101.32 | 36.55 | 122.72 | 0.0 | 2.79 s | 9.192810 |
+| EP4 **decoupled, CUTLASS** | **45.73** | **82.25** | 36.52 | 103.30 | 0.0 | **2.73 s** | 9.192413 |
+| AutoModel EP4 (colleague) | — | 83.79 | — | — | — | 2.59 s | — |
+
+- On this recipe CUTLASS reproduces the colleague's result: −19.0 GiB, and the probe shows it is entirely
+  **resident** memory (the Triton grouped-GEMM path keeps ~19 GiB of persistent state that CUTLASS does not);
+  the transient part (peak − resident ≈ 36.5 GiB) is identical in all four runs. In the compiled + activation-
+  offload prod-like recipe of §8 the same switch changes nothing, so that persistent state is specific to the
+  eager Triton path.
+- The two savings are additive (decoupling: −15.5 GiB resident, CUTLASS: −19.0 GiB resident) because they
+  remove different things — EP-replicated dense parameter/optimizer state vs. Triton-path buffers.
+- **Decoupled + CUTLASS: 82.25 GiB peak, 2.73 s/step — at AutoModel's 83.79 GiB / 2.59 s.** The XTuner–AutoModel
+  memory gap on the EP4 parity recipe is closed; what remains is a ~5% step-time difference.
+- Legacy + CUTLASS (97.96 GiB, 128 GiB reserved) also escapes the allocator ceiling in this recipe, which is
+  why the colleague measured 2.41 s for it; legacy + Triton at 116.9 GiB does not (3.2 retries/step).
 
 ## 6. Per-step llm loss (all runs)
 
