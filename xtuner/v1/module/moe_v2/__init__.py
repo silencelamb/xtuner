@@ -21,7 +21,7 @@ from .contracts import (
     rows_from_psum,
     rows_psum,
 )
-from .decoder_layer import MoEDecoderLayerV2
+from .decoder_layer import MoEDecoderLayerV2, make_v2_decoder_cls
 from .experts import GroupedExpertsV2
 
 
@@ -35,6 +35,7 @@ __all__ = [
     "GroupedExpertsV2",
     "LayerEPExecution",
     "MoEDecoderLayerV2",
+    "make_v2_decoder_cls",
     "MoESpec",
     "MoEV2Config",
     "NoOpEPExecutionRuntime",

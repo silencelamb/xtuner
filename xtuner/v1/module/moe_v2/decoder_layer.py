@@ -157,8 +157,15 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
                 else moe_v2_cfg.expert_alignment,
                 fp8_dispatch=moe_v2_cfg.fp8_dispatch,
             )
-            self.dispatcher = DeepEPV2Dispatcher(spec=spec, group=ep_group, cfg=moe_v2_cfg)  # type: ignore[assignment]
+            self.dispatcher = DeepEPV2Dispatcher(  # type: ignore[assignment]
+                spec=spec, group=ep_group, cfg=moe_v2_cfg, tma_aligned_sf=self.experts.gemm.caps.name == "deepgemm"
+            )
         self.caps = self.dispatcher.caps
+        if self.caps.static_shape and not self.experts.gemm.caps.static_shape_friendly:
+            raise ValueError(
+                f"GEMM backend {self.experts.gemm.caps.name!r} cannot consume the static (worst-case capacity) layout of "
+                f"dispatcher {self.caps.name!r}; use cpu_sync=True or gemm_backend='deepgemm' / 'triton'."
+            )
         # Execution axis (identity until a runtime binds this layer).
         self.ep_exec: LayerEPExecution = NoOpLayerEPExecution(layer_idx)
         # Token dimension is dynamic unless the dispatcher guarantees static output shapes.
@@ -190,7 +197,8 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
         origin_shape = hidden_states.shape
         async_op = self._ep_enabled
 
-        pre, dispatched, batch = self._dispatch_stage(hidden_states, router_results, call, async_op=async_op)
+        pre, topk_weights = self._pre_dispatch_stage(hidden_states, router_results, call, async_op=async_op)
+        dispatched, batch = self._dispatch_stage(pre, topk_weights, call, async_op=async_op)
         out = self._experts_stage(batch, call)
         pre_combined = self.dispatcher.combine_preprocess(
             hidden_states=out, pre_dispatched=pre, dispatched=dispatched, layer_state=call, async_op=async_op
@@ -228,6 +236,9 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
         position_embeddings_list: list[tuple[Tensor, Tensor]],
         attention_kwargs_list: list[dict[str, object]] | None = None,
     ) -> MoEDecoderLayerMicroBatchOutput:
+        # Same interleaving as the legacy decoder: all attentions are queued before the first dispatch (which may
+        # block the host in cpu_sync mode), experts of MB i are queued before dispatch of MB i+1, and every combine
+        # is queued before the first combine_postprocess, so comm of one micro-batch overlaps compute of the other.
         n = len(hidden_states_list)
         if attention_kwargs_list is None:
             attention_kwargs_list = [{} for _ in range(n)]
@@ -238,10 +249,9 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
         attn_outputs_list: list[AttnOutputs] = []
         pre_moe_out_list: list[Tensor] = []
         pre_list: list[Any] = []
-        dispatched_list: list[Any] = []
-        batch_list: list[ExpertBatch] = []
+        topk_weights_list: list[Tensor] = []
 
-        # Stage 1: attention + router + dispatch launch for every micro-batch (dispatch overlaps the next attention).
+        # Stage 1: attention + router + dispatch_preprocess for every micro-batch.
         for i in range(n):
             residual, hs, router_results, attn_outputs = self._pre_moe_forward(
                 hidden_states=hidden_states_list[i],
@@ -250,43 +260,48 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
                 state=ForwardState.TRAINING,
                 attention_kwargs=attention_kwargs_list[i],
             )
-            pre_moe_out_list.append(hs)
-            pre, dispatched, batch = self._dispatch_stage(hs, router_results, calls[i], async_op=True)
+            pre, topk_weights = self._pre_dispatch_stage(hs, router_results, calls[i], async_op=True)
             residual_list.append(residual)
             router_results_list.append(router_results)
             attn_outputs_list.append(attn_outputs)
+            pre_moe_out_list.append(hs)
             pre_list.append(pre)
-            dispatched_list.append(dispatched)
-            batch_list.append(batch)
+            topk_weights_list.append(topk_weights)
 
-        # Stage 2: experts + combine launch; combine of MB i overlaps experts of MB i+1.
+        # Stage 2: dispatch + experts + combine_preprocess; dispatch of MB i+1 overlaps experts of MB i.
+        dispatched_list: list[Any] = []
         pre_combined_list: list[Any] = []
-        combined_list: list[Any] = []
         for i in range(n):
-            out = self._experts_stage(batch_list[i], calls[i])
+            dispatched, batch = self._dispatch_stage(pre_list[i], topk_weights_list[i], calls[i], async_op=True)
+            out = self._experts_stage(batch, calls[i])
             pre_combined = self.dispatcher.combine_preprocess(
                 hidden_states=out,
                 pre_dispatched=pre_list[i],
-                dispatched=dispatched_list[i],
+                dispatched=dispatched,
                 layer_state=calls[i],
                 async_op=True,
             )
-            combined = self.dispatcher.combine(
+            dispatched_list.append(dispatched)
+            pre_combined_list.append(pre_combined)
+
+        # Stage 3: combine launches; combine of MB i overlaps experts of MB i+1 / the shared experts.
+        combined_list: list[Any] = [
+            self.dispatcher.combine(
                 pre_dispatched=pre_list[i],
                 dispatched=dispatched_list[i],
-                pre_combined=pre_combined,
+                pre_combined=pre_combined_list[i],
                 layer_state=calls[i],
                 async_op=True,
             )
-            pre_combined_list.append(pre_combined)
-            combined_list.append(combined)
+            for i in range(n)
+        ]
 
         shared_out_list: list[Tensor | None] = [
             self._shared_experts_forward(hidden_states=hs) if self.n_shared_experts > 0 else None
             for hs in pre_moe_out_list
         ]
 
-        # Stage 3: collect combines, residual add.
+        # Stage 4: collect combines, residual add.
         hidden_out_list: list[Tensor] = []
         for i in range(n):
             y = self.dispatcher.combine_postprocess(
@@ -312,9 +327,9 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
     # ------------------------------------------------------------------------------------------------------------
     # stages shared by both paths
     # ------------------------------------------------------------------------------------------------------------
-    def _dispatch_stage(
+    def _pre_dispatch_stage(
         self, hidden_states: Tensor, router_results: RouterResults, call: EPCall, *, async_op: bool
-    ) -> tuple[Any, Any, ExpertBatch]:
+    ) -> tuple[Any, Tensor]:
         flat = hidden_states.view(-1, hidden_states.shape[-1])
         flat, topk_ids, topk_weights = self.ep_exec.prepare_dispatch(
             call, flat, router_results["topk_ids"], router_results["topk_weights"]
@@ -327,6 +342,11 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
             layer_state=call,
             async_op=async_op,
         )
+        return pre, topk_weights
+
+    def _dispatch_stage(
+        self, pre: Any, topk_weights: Tensor, call: EPCall, *, async_op: bool
+    ) -> tuple[Any, ExpertBatch]:
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre, topk_weights=topk_weights, layer_state=call, async_op=async_op
         )
@@ -336,7 +356,7 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
         batch = self.ep_exec.prepare_experts(call, batch)
         if self._check_rows:
             check_rows(batch["rows"], batch["hidden_states"].shape[0])
-        return pre, dispatched, batch
+        return dispatched, batch
 
     def _experts_stage(self, batch: ExpertBatch, call: EPCall) -> Tensor:
         if self._dynamic_tokens and self._ep_enabled:
@@ -348,4 +368,27 @@ class MoEDecoderLayerV2(MoEDecoderLayer):
         return self.ep_exec.attach_after_experts(call, out)
 
 
-__all__ = ["MoEDecoderLayerV2"]
+_V2_CLASSES: dict[type, type] = {}
+
+
+def make_v2_decoder_cls(base_cls: type[MoEDecoderLayer]) -> type[MoEDecoderLayerV2]:
+    """Compose the V2 MoE stages with a model-specific decoder class.
+
+    Model families override ``forward`` / ``_build_output`` (e.g. GLM-5.2 threads DSA top-k ids through
+    ``attention_kwargs``) but keep ``_forward`` / ``_micro_batch_forward``; the V2 mixin replaces exactly those two,
+    so ``type(name, (MoEDecoderLayerV2, base_cls), {})`` gives the model's wrapper with the contract-based MoE segment.
+
+    Args:
+        base_cls (type[MoEDecoderLayer]): The model's decoder layer class.
+
+    Returns:
+        type[MoEDecoderLayerV2]: ``MoEDecoderLayerV2`` itself for the generic layer, otherwise a cached subclass.
+    """
+    if base_cls is MoEDecoderLayer or issubclass(base_cls, MoEDecoderLayerV2):
+        return MoEDecoderLayerV2
+    if base_cls not in _V2_CLASSES:
+        _V2_CLASSES[base_cls] = type(f"{base_cls.__name__}V2", (MoEDecoderLayerV2, base_cls), {})
+    return _V2_CLASSES[base_cls]
+
+
+__all__ = ["MoEDecoderLayerV2", "make_v2_decoder_cls"]

@@ -42,6 +42,8 @@ class TestMoEDecoderV2ParityEP(DeterministicDDPTestCase):
         self.create_pg("cuda")
         os.environ["LOCAL_RANK"] = str(dist.get_rank() % torch.cuda.device_count())
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        # DeepEP >= 2 (also its legacy Buffer) rejects deterministic mode with fill_uninitialized_memory on.
+        torch.utils.deterministic.fill_uninitialized_memory = False
         ep_mesh = init_device_mesh("cuda", (self.world_size,), mesh_dim_names=("ep",))
         f8 = Float8Config(scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE) if fp8 else None
         v2_cfg = MoEV2Config(

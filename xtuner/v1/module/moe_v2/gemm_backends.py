@@ -100,6 +100,7 @@ class _AdaptiveGemmFP8Rows(torch.autograd.Function):
 
         from xtuner.v1.float8.triton_kernels import per_tile_quant, trans_per_block_quant_expand_128x
 
+        x, x_scale = unwrap_fp8_activation(x, x_scale)
         ne, dout, din = w_fp8.shape
         ctx.input_shape = (x.shape[0], din)
         ctx.weight_shape = (ne, dout, din)
@@ -115,7 +116,7 @@ class _AdaptiveGemmFP8Rows(torch.autograd.Function):
             x_bf16_for_wgrad = x
         else:
             # Pre-quantized activation (FP8 dispatch): dequantize once for the wgrad-side re-quantization.
-            x_fp8, x_sf = x, x_scale
+            x_fp8, x_sf = x, row_major_scales(x, x_scale)
             x_bf16_for_wgrad = _dequant_per_tile(x_fp8, x_sf)
         x_t_fp8, x_t_sf, _ = trans_per_block_quant_expand_128x(
             x_bf16_for_wgrad, compute_counts, group_size=128, dtype=torch.float8_e4m3fn
@@ -158,13 +159,35 @@ class _AdaptiveGemmFP8Rows(torch.autograd.Function):
         return dx, None, dw, None
 
 
+def unwrap_fp8_activation(x: Tensor, x_scale: Tensor | None) -> tuple[Tensor, Tensor | None]:
+    """Return ``(payload, scales)`` for a BF16 tensor, an ``(fp8, sf)`` pair or a ``Float8Tensor`` wrapper."""
+    from xtuner.v1.float8.float8_tensor import Float8Tensor
+
+    if isinstance(x, Float8Tensor):
+        return x._data, x._scale
+    return x, x_scale
+
+
+def row_major_scales(x_fp8: Tensor, x_sf: Tensor) -> Tensor:
+    """Normalize per-tile scales to a contiguous ``[M, K/128]`` view (DeepEP may hand out the MN-major TMA layout)."""
+    m, k = x_fp8.shape
+    if x_sf.shape != (m, k // 128):
+        x_sf = x_sf.t()
+    return x_sf.contiguous()
+
+
 def _dequant_per_tile(x_fp8: Tensor, x_sf: Tensor) -> Tensor:
     m, k = x_fp8.shape
+    x_sf = row_major_scales(x_fp8, x_sf)
     return (x_fp8.view(m, k // 128, 128).to(torch.float32) * x_sf.view(m, k // 128, 1)).view(m, k).to(torch.bfloat16)
 
 
 class AdaptiveGemmFP8Backend:
-    caps = GemmCaps(name="adaptive_gemm", fp8=True, required_alignment=1, accepts_padding_rows=True)
+    # The AdaptiveGEMM kernels derive M from the activation and assume sum(counts) == M, so they cannot run on a
+    # static (worst-case) capacity buffer whose tail rows belong to no group.
+    caps = GemmCaps(
+        name="adaptive_gemm", fp8=True, required_alignment=1, accepts_padding_rows=True, static_shape_friendly=False
+    )
 
     def gemm(self, x: Tensor, x_scale: Tensor | None, weight: Any, rows: ExpertRows, *, trans_b: bool) -> Tensor:
         assert trans_b
@@ -221,6 +244,8 @@ def _deepgemm_psum_available() -> bool:
 
 __all__ = [
     "AdaptiveGemmFP8Backend",
+    "row_major_scales",
+    "unwrap_fp8_activation",
     "GemmBackend",
     "GemmCaps",
     "TritonBF16Backend",

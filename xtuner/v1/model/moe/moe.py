@@ -74,7 +74,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerOutput,
     MoEGate,
 )
-from xtuner.v1.module.moe_v2 import MoEDecoderLayerV2, MoEV2Config, validate_moe_v2_config
+from xtuner.v1.module.moe_v2 import MoEV2Config, make_v2_decoder_cls, validate_moe_v2_config
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
@@ -227,7 +227,9 @@ class MoE(BaseModel):
         moe_v2_cfg = self._resolve_moe_v2_cfg(config)
         if moe_v2_cfg is not None:
             validate_moe_v2_config(config, moe_v2_cfg)
-            self.moe_decoder_layer_cls = partial(MoEDecoderLayerV2, moe_v2_cfg=moe_v2_cfg)  # type: ignore[assignment]
+            # Keep the model family's decoder wrapper (e.g. GLM-5.2 DSA ids) and swap in the contract-based MoE segment.
+            v2_cls = make_v2_decoder_cls(type(self).moe_decoder_layer_cls)
+            self.moe_decoder_layer_cls = partial(v2_cls, moe_v2_cfg=moe_v2_cfg)  # type: ignore[assignment]
 
         super().__init__(config)
         ep_size = config.ep_size if config.ep_size is not None else 1
