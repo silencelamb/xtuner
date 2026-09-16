@@ -2,6 +2,7 @@
 import contextlib
 import os
 import types
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self, Sequence, TypedDict, cast
 
@@ -73,6 +74,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerOutput,
     MoEGate,
 )
+from xtuner.v1.module.moe_v2 import MoEDecoderLayerV2, MoEV2Config, validate_moe_v2_config
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
@@ -92,8 +94,10 @@ logger = get_logger()
 
 
 MOE_BLOCK_FORWARD = "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEBlock.forward"
+MOE_V2_EXPERTS_FORWARD = "xtuner.v1.module.moe_v2.experts.GroupedExpertsV2.forward"
 MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
     MOE_BLOCK_FORWARD: TorchCompileOption(fullgraph=True),
+    MOE_V2_EXPERTS_FORWARD: TorchCompileOption(fullgraph=True),
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward": TorchCompileOption(fullgraph=True),
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer._pre_moe_forward": TorchCompileOption(
         fullgraph=True
@@ -159,7 +163,10 @@ class MoEConfig(TransformerConfig):
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
     expert_tp_size: Annotated[int, Parameter(group="moe")] = 1
-    dispatcher: Annotated[Literal["deepep", "all2all", "agrs"] | None, Parameter(group="moe")] = None
+    dispatcher: Annotated[Literal["deepep", "all2all", "agrs", "deepep_v2"] | None, Parameter(group="moe")] = None
+    # Unified-EP-contract path (``xtuner.v1.module.moe_v2``). ``dispatcher="deepep_v2"`` enables it with default
+    # options; set ``moe_v2_cfg`` to tune it or to run a legacy dispatcher behind the contract.
+    moe_v2_cfg: MoEV2Config | None = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
@@ -216,6 +223,11 @@ class MoE(BaseModel):
             assert config.ep_size == config.router.router_n_groups == 8, (
                 "Currently, AGRS dispatcher requires ep_size and router_n_groups to be 8"
             )
+
+        moe_v2_cfg = self._resolve_moe_v2_cfg(config)
+        if moe_v2_cfg is not None:
+            validate_moe_v2_config(config, moe_v2_cfg)
+            self.moe_decoder_layer_cls = partial(MoEDecoderLayerV2, moe_v2_cfg=moe_v2_cfg)  # type: ignore[assignment]
 
         super().__init__(config)
         ep_size = config.ep_size if config.ep_size is not None else 1
@@ -275,6 +287,14 @@ class MoE(BaseModel):
             n_routed_experts=self.config.n_routed_experts,
             num_experts_per_tok=self.config.num_experts_per_tok,
         )
+
+    @staticmethod
+    def _resolve_moe_v2_cfg(config: MoEConfig) -> MoEV2Config | None:
+        if config.moe_v2_cfg is not None:
+            return config.moe_v2_cfg
+        if config.dispatcher == "deepep_v2":
+            return MoEV2Config()
+        return None
 
     @override
     @torch.no_grad()

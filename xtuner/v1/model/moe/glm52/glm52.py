@@ -45,6 +45,7 @@ from .mtp import GLM52MTPBlock, GLM52MTPLayer
 # results are validated. Each boundary can be tightened independently later.
 MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEBlock.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.module.moe_v2.experts.GroupedExpertsV2.forward": TorchCompileOption(fullgraph=True),
     "xtuner.v1.model.moe.glm52.decoder_layer.GLM52MoEDecoderLayer.forward": TorchCompileOption(fullgraph=False),
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer._pre_moe_forward": TorchCompileOption(
         fullgraph=False
