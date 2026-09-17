@@ -74,6 +74,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEGate,
 )
 from xtuner.v1.module.dispatcher import EPExecutionRuntime, NoOpEPExecutionRuntime
+from xtuner.v1.module.dispatcher.deepep_v2 import DeepEPV2Config
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
@@ -160,7 +161,9 @@ class MoEConfig(TransformerConfig):
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
     expert_tp_size: Annotated[int, Parameter(group="moe")] = 1
-    dispatcher: Annotated[Literal["deepep", "all2all", "agrs"] | None, Parameter(group="moe")] = None
+    dispatcher: Annotated[Literal["deepep", "all2all", "agrs", "deepep_v2"] | None, Parameter(group="moe")] = None
+    # Options of the DeepEP V2 dispatcher (``dispatcher="deepep_v2"``); ``None`` means its defaults.
+    deepep_v2_cfg: DeepEPV2Config | None = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
@@ -218,6 +221,13 @@ class MoE(BaseModel):
                 "Currently, AGRS dispatcher requires ep_size and router_n_groups to be 8"
             )
 
+        if config.dispatcher == "deepep_v2":
+            assert config.expert_tp_size == 1, "DeepEP V2 dispatcher does not support expert TP yet"
+            fp8_experts = (
+                config.float8_cfg is not None and config.float8_cfg.scaling_granularity_grouped_gemm is not None
+            )
+            if config.deepep_v2_cfg is not None and config.deepep_v2_cfg.fp8_dispatch and not fp8_experts:
+                raise ValueError("deepep_v2_cfg.fp8_dispatch requires FP8 grouped GEMM (Float8Config)")
         super().__init__(config)
         ep_size = config.ep_size if config.ep_size is not None else 1
         expert_tp_size = config.expert_tp_size if config.expert_tp_size > 1 else 1
@@ -1169,6 +1179,7 @@ class MoE(BaseModel):
                     float8_cfg=config.float8_cfg,
                     layer_idx=layer_idx,
                     dispatcher=config.dispatcher,
+                    deepep_v2_cfg=config.deepep_v2_cfg,
                     ep_mesh=self.ep_mesh,
                     expert_tp_mesh=self.expert_tp_mesh,
                     ep_tp_mesh=self.ep_tp_mesh,
@@ -1236,6 +1247,7 @@ class MoE(BaseModel):
                 float8_cfg=config.float8_cfg,
                 layer_idx=config.num_hidden_layers + i,
                 dispatcher=config.dispatcher,
+                deepep_v2_cfg=config.deepep_v2_cfg,
                 ep_mesh=self.ep_mesh,
                 expert_tp_mesh=self.expert_tp_mesh,
                 ep_tp_mesh=self.ep_tp_mesh,

@@ -13,6 +13,7 @@ if check_torch_accelerator_available() and check_triton_available():
     from .per_tile_quant import per_tile_quant
     from .trans_per_block_quant_gemm import trans_per_block_quant_gemm
     from .trans_per_tile_quant_gemm import trans_per_tile_quant_gemm
+    from .trans_quant_kgrouped import static_ks_host, trans_quant_kgrouped
     from .trans_quant_per_block import trans_per_block_quant_expand_128x
     from .trans_quant_per_tile import trans_per_tile_quant_expand_128x
 else:
@@ -24,6 +25,8 @@ else:
     trans_per_tile_quant_gemm = env_not_available_func
     trans_per_block_quant_expand_128x = env_not_available_func
     trans_per_tile_quant_expand_128x = env_not_available_func
+    trans_quant_kgrouped = env_not_available_func
+    static_ks_host = env_not_available_func
 
 __all__ = [
     "trans_per_block_quant_expand_128x",
@@ -33,4 +36,6 @@ __all__ = [
     "trans_per_block_quant_gemm",
     "trans_per_tile_quant_gemm",
     "per_block_dequant_gemm",
+    "trans_quant_kgrouped",
+    "static_ks_host",
 ]

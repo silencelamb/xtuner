@@ -18,11 +18,22 @@ from xtuner.v1.float8.triton_kernels import (
     trans_per_block_quant_expand_128x,
     trans_per_tile_quant_expand_128x,
 )
+from xtuner.v1.ops.moe.cuda.group_gemm_deepgemm import (
+    deepgemm_fp8_group_gemm,
+    row_major_scales,
+    unwrap_fp8_activation,
+)
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
 if TYPE_CHECKING:
     from xtuner.v1.module.dispatcher.base import ExpertRows
+
+
+def use_deepgemm(rows: "ExpertRows") -> bool:
+    from xtuner.v1.module.grouped_linear.moe_group_linear import use_deepgemm as _use_deepgemm
+
+    return _use_deepgemm(rows)
 
 
 # from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
@@ -90,7 +101,10 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
 
 class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_fp8, tokens_per_expert):
+    def forward(ctx, x, x_scale, w_fp8, tokens_per_expert):
+        # ``x`` is bf16 (quantized here), or fp8 e4m3 together with its per-tile ``x_scale`` when the dispatcher
+        # already quantized it (FP8 dispatch); the wgrad-side transposed re-quantization then starts from the
+        # dequantized values, one extra rounding like every DeepSeek-style FP8 recipe.
         seq, din = x.shape
         ne, dout, din = w_fp8.shape
         ctx.zero_token_dispatch = seq == 0
@@ -98,9 +112,15 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
         ctx.weight_shape = w_fp8.shape
 
         if ctx.zero_token_dispatch:
-            return x.new_empty((seq, dout))
+            return x.new_empty((seq, dout), dtype=torch.bfloat16)
 
-        x_fp8, x_scale = per_tile_quant(x)
+        if x_scale is None:
+            x_fp8, x_scale = per_tile_quant(x)
+        else:
+            x_fp8 = x
+            x_scale = row_major_scales(x_fp8, x_scale)
+            x = (x_fp8.view(seq, din // 128, 128).float() * x_scale.view(seq, din // 128, 1)).view(seq, din)
+            x = x.to(torch.bfloat16)
         (
             x_trans_quant_fp8,
             x_trans_quant_scale,
@@ -117,9 +137,9 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output_hp):
         if ctx.zero_token_dispatch:
-            dx = grad_output_hp.new_empty(ctx.input_shape)
-            dw = grad_output_hp.new_zeros(ctx.weight_shape)
-            return dx, dw, None
+            dx = grad_output_hp.new_empty(ctx.input_shape, dtype=torch.bfloat16)
+            dw = grad_output_hp.new_zeros(ctx.weight_shape, dtype=torch.bfloat16)
+            return dx, None, dw, None
 
         (
             x_trans_quant_fp8,
@@ -155,7 +175,7 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
             tokens_per_expert_expand.int(),
         )
 
-        return dx, dw, None
+        return dx, None, dw, None
 
 
 # Use torch._dynamo.allow_in_graph to allow the fwd out is a Float8Tensor but the
@@ -370,15 +390,17 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         Returns:
             torch.Tensor: ``[capacity, local_out_features]`` in the same row layout.
         """
-        if x_scale is not None:
-            raise NotImplementedError("TileWiseFloat8GroupedLinear does not consume pre-quantized activations yet")
         weight_fp8 = self._weight_fp8() if weight is None else weight
-        tokens_per_expert = rows.compute_counts
-
         orig_shape = input.shape
         num_tokens = input.numel() // input.shape[-1]
         input = input.view(num_tokens, input.shape[-1])
-        out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
+        if use_deepgemm(rows):
+            out = deepgemm_fp8_group_gemm(input, x_scale, weight_fp8, rows)
+        else:
+            input, x_scale = unwrap_fp8_activation(input, x_scale)
+            # The AdaptiveGEMM kernels want int64 counts and derive M from the activation (sum(counts) == M).
+            counts = rows.compute_counts.to(torch.int64)
+            out = fp8_gmm_weight_per_block_act_per_tile.apply(input, x_scale, weight_fp8, counts)
         out = out.view(*orig_shape[:-1], self.local_out_features)
         return out
 

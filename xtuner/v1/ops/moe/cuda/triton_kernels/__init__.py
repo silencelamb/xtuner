@@ -13,18 +13,24 @@ if check_torch_accelerator_available() and check_triton_available():
     if triton.__version__ >= "3.4.0":
         from .k_grouped_gemm_TMA_triton3_4 import k_grouped_gemm
         from .m_grouped_gemm_TMA_triton3_4 import m_grouped_gemm
+        from .row_scale import row_scale, row_scale_bwd
     elif triton.__version__ >= "3.2.0":
         from .k_grouped_gemm_TMA import k_grouped_gemm
         from .m_grouped_gemm_TMA import m_grouped_gemm
+        from .row_scale import row_scale, row_scale_bwd
     else:
         env_not_available_func = get_env_not_available_func(["torch.accelerator", "triton"])
         k_grouped_gemm = env_not_available_func
         m_grouped_gemm = env_not_available_func
+        row_scale = env_not_available_func
+        row_scale_bwd = env_not_available_func
 
 else:
     env_not_available_func = get_env_not_available_func(["torch.accelerator", "triton"])
     k_grouped_gemm = env_not_available_func
     m_grouped_gemm = env_not_available_func
+    row_scale = env_not_available_func
+    row_scale_bwd = env_not_available_func
 
 
-__all__ = ["k_grouped_gemm", "m_grouped_gemm"]
+__all__ = ["k_grouped_gemm", "m_grouped_gemm", "row_scale", "row_scale_bwd"]
