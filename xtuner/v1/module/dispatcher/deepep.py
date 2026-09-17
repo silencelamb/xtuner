@@ -20,11 +20,14 @@ from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
     CombineResult,
     DispatchResult,
+    EPCall,
+    ExpertWeights,
     GenericDispatcher,
     PostCombineResult,
     PostDispatchResult,
     PreCombineResult,
     PreDispatchResult,
+    rows_from_counts,
 )
 
 
@@ -325,6 +328,8 @@ class DeepEPDispatcher(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         async_op: bool = False,
+        tokens_per_expert: torch.Tensor | None = None,  # noqa: ARG002 — contract seam, unused by this dispatcher
+        layer_state: EPCall | None = None,  # noqa: ARG002
     ) -> DeepEPPreDispatchResult:
         if async_op:
             backward_previous_event = EventOverlap(None)
@@ -499,8 +504,11 @@ class DeepEPDispatcher(
         else:
             return DeepEPPostDispatchResult(
                 hidden_states=permuted_hidden_states,
+                hidden_scales=None,
                 row_ids_map=row_ids_map,
                 tokens_per_expert=tokens_per_expert,
+                rows=rows_from_counts(tokens_per_expert),
+                expert_weights=ExpertWeights(),
             )
 
     @override
