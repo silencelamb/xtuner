@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable, Literal, Protocol, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, TypeAlias, TypedDict, cast
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,10 @@ from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.module.dispatcher.deepep_v2 import DeepEPV2Config
 
 
 RouterLogits: TypeAlias = torch.Tensor
@@ -280,12 +284,15 @@ class MoEDecoderLayer(nn.Module):
         moe_act_fn_cfg: MoEActFnConfig,
         float8_cfg: Float8Config | None = None,
         layer_idx: int = 0,
-        dispatcher: Literal["deepep", "all2all", "agrs"] | None,
+        dispatcher: Literal["deepep", "all2all", "agrs", "deepep_v2"] | None,
+        deepep_v2_cfg: "DeepEPV2Config | None" = None,
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
     ):
         super().__init__()
+        if dispatcher == "deepep_v2" and moe_bias and (deepep_v2_cfg is None or deepep_v2_cfg.expert_alignment > 1):
+            raise NotImplementedError("routed-expert bias is not supported on the aligned DeepEP V2 layout yet")
         self.ep_mesh = ep_mesh
         self.ep_tp_mesh = ep_tp_mesh
         self.hidden_size = hidden_size
@@ -356,6 +363,9 @@ class MoEDecoderLayer(nn.Module):
             ep_tp_group=ep_tp_group,
             training_dtype="fp8" if float8_cfg is not None else "bf16",
             generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
+            hidden_size=hidden_size,
+            num_experts_per_tok=num_experts_per_tok,
+            deepep_v2_cfg=deepep_v2_cfg,
         )
         # EP communication runs asynchronously on its own stream whenever tokens cross ranks; the EP=1 naive
         # dispatcher stays synchronous. Kept out of the compiled forward.

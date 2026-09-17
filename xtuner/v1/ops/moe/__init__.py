@@ -75,6 +75,15 @@ def get_token_unpermute() -> MoeUnpermuteProtocol:
         raise NotImplementedError
 
 
+def get_expert_gemm_backend() -> str:
+    """Expert grouped-GEMM backend selection: ``auto`` (DeepGEMM on 128-aligned layouts when importable, else the
+    legacy kernels), ``legacy`` or ``deepgemm``; overridable with ``XTUNER_EXPERT_GEMM_BACKEND``."""
+    backend = os.environ.get("XTUNER_EXPERT_GEMM_BACKEND", "auto").lower()
+    if backend not in ("auto", "legacy", "deepgemm"):
+        raise ValueError(f"XTUNER_EXPERT_GEMM_BACKEND must be auto | legacy | deepgemm, got {backend!r}")
+    return backend
+
+
 group_gemm = get_group_gemm()
 permute = get_token_permute()
 unpermute = get_token_unpermute()

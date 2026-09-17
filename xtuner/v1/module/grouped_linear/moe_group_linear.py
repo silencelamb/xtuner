@@ -8,6 +8,8 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import TileWiseFloat8GroupedLinear
 from xtuner.v1.ops import group_gemm
+from xtuner.v1.ops.moe import get_expert_gemm_backend
+from xtuner.v1.ops.moe.cuda.group_gemm_deepgemm import deepgemm_available, deepgemm_group_gemm
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
@@ -188,7 +190,10 @@ class GroupedLinear(nn.Module):
             weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
             weight = weight.view(-1, self.local_out_features, self.local_in_features)
         tokens_per_expert = rows.compute_counts
-        out = group_gemm(x, weight, tokens_per_expert)
+        if use_deepgemm(rows):
+            out = deepgemm_group_gemm(x, weight, rows)
+        else:
+            out = group_gemm(x, weight, tokens_per_expert)
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
@@ -197,6 +202,25 @@ class GroupedLinear(nn.Module):
                 return out
             out = out + bias.repeat_interleave(tokens_per_expert, dim=0)  # TODO: 无法 compile
         return out
+
+
+def use_deepgemm(rows: "ExpertRows") -> bool:
+    """Whether the expert GEMMs of a batch run on DeepGEMM's psum kernels (requires a 128-aligned row layout).
+
+    Args:
+        rows (ExpertRows): Row layout of the batch.
+
+    Returns:
+        bool: True for the DeepGEMM path, False for the counts-based legacy kernels.
+    """
+    backend = get_expert_gemm_backend()
+    if backend == "legacy":
+        return False
+    if rows.alignment != 128:
+        if backend == "deepgemm":
+            raise ValueError("XTUNER_EXPERT_GEMM_BACKEND=deepgemm needs a 128-aligned dispatch layout (DeepEP V2)")
+        return False
+    return backend == "deepgemm" or deepgemm_available()
 
 
 def build_grouped_linear(
