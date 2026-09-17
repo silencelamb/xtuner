@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 import math
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,10 @@ from xtuner.v1.float8.triton_kernels import (
     trans_per_tile_quant_expand_128x,
 )
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.module.dispatcher.base import ExpertRows
 
 
 # from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
@@ -346,20 +350,30 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
                 f"but got {weight.shape}."
             )
 
-    def forward(self, input: torch.Tensor, tokens_per_expert, decoding: bool = False) -> torch.Tensor:
-        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+    def forward(
+        self,
+        input: torch.Tensor,
+        rows: "ExpertRows",
+        *,
+        x_scale: torch.Tensor | None = None,
+        weight: Float8Tensor | None = None,
+    ) -> torch.Tensor:
+        """FP8 grouped GEMM (per-block weights, per-tile activations) over the dispatched row layout.
 
-        self._check_shape(weight)
+        Args:
+            input (torch.Tensor): ``[capacity, in_features]`` activations laid out as described by ``rows``.
+            rows (ExpertRows): Row layout of ``input``; the kernels consume ``rows.compute_counts``.
+            x_scale (torch.Tensor | None): Per-tile scales of a pre-quantized FP8 ``input``; not supported yet.
+            weight (Float8Tensor | None): Call-local FP8 weight ``[local_experts, out, in]`` used instead of the
+                parameter.
 
-        if tensor_already_casted_to_fp8(weight):
-            # If we use fsdp, the weight is already casted to fp8.
-            # FSDP padding only extends flattened dim0; trim it before restoring
-            # the local (expert, out, in) grouped-GEMM layout.
-            weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
-            weight_fp8 = view_weight.apply(weight_fp8, self.ori_local_shape)
-        else:
-            weight = weight.view(*self.ori_local_shape)
-            weight_fp8 = weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
+        Returns:
+            torch.Tensor: ``[capacity, local_out_features]`` in the same row layout.
+        """
+        if x_scale is not None:
+            raise NotImplementedError("TileWiseFloat8GroupedLinear does not consume pre-quantized activations yet")
+        weight_fp8 = self._weight_fp8() if weight is None else weight
+        tokens_per_expert = rows.compute_counts
 
         orig_shape = input.shape
         num_tokens = input.numel() // input.shape[-1]
@@ -367,6 +381,18 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
         out = out.view(*orig_shape[:-1], self.local_out_features)
         return out
+
+    def _weight_fp8(self) -> Float8Tensor:
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        self._check_shape(weight)
+        if tensor_already_casted_to_fp8(weight):
+            # If we use fsdp, the weight is already casted to fp8.
+            # FSDP padding only extends flattened dim0; trim it before restoring
+            # the local (expert, out, in) grouped-GEMM layout.
+            weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
+            return view_weight.apply(weight_fp8, self.ori_local_shape)
+        weight = weight.view(*self.ori_local_shape)
+        return weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
 
     @property
     def is_padded(self) -> bool:

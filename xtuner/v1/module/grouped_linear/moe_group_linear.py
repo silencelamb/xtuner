@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
@@ -9,6 +9,10 @@ from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import TileWiseFloat8GroupedLinear
 from xtuner.v1.ops import group_gemm
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.module.dispatcher.base import ExpertRows
 
 
 GroupedLinearParallelStyle = Literal["column", "row"]
@@ -159,9 +163,31 @@ class GroupedLinear(nn.Module):
                 else:
                     self.bias = nn.Parameter(bias)
 
-    def forward(self, x: torch.Tensor, tokens_per_expert: torch.Tensor, decoding: bool = False):
-        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-        weight = weight.view(-1, self.local_out_features, self.local_in_features)
+    def forward(
+        self,
+        x: torch.Tensor,
+        rows: "ExpertRows",
+        *,
+        x_scale: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Grouped GEMM over the dispatched row layout.
+
+        Args:
+            x (torch.Tensor): ``[capacity, in_features]`` activations laid out as described by ``rows``.
+            rows (ExpertRows): Row layout of ``x``; the counts-based kernels consume ``rows.compute_counts``.
+            x_scale (torch.Tensor | None): Per-tile FP8 scales of a pre-quantized ``x``; not supported here.
+            weight (torch.Tensor | None): Call-local weight ``[local_experts, out, in]`` used instead of the parameter.
+
+        Returns:
+            torch.Tensor: ``[capacity, local_out_features]`` in the same row layout.
+        """
+        if x_scale is not None:
+            raise NotImplementedError("GroupedLinear (BF16) does not consume pre-quantized FP8 activations")
+        if weight is None:
+            weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+            weight = weight.view(-1, self.local_out_features, self.local_in_features)
+        tokens_per_expert = rows.compute_counts
         out = group_gemm(x, weight, tokens_per_expert)
 
         if self.moe_bias:

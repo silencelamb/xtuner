@@ -13,11 +13,14 @@ from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
     CombineResult,
     DispatchResult,
+    EPCall,
+    ExpertWeights,
     GenericDispatcher,
     PostCombineResult,
     PostDispatchResult,
     PreCombineResult,
     PreDispatchResult,
+    rows_from_counts,
 )
 from .expert_tp import ExpertTP
 
@@ -333,6 +336,8 @@ class TorchAll2AllDispatcher(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,  # noqa: ARG002 — kept for interface compatibility; not used here
         async_op: bool = False,
+        tokens_per_expert: torch.Tensor | None = None,  # noqa: ARG002 — contract seam, unused by this dispatcher
+        layer_state: EPCall | None = None,  # noqa: ARG002
     ) -> TorchAll2AllPreDispatchResult:
         permuted_hidden_states, row_ids_map = permute(hidden_states, topk_ids.to(torch.int32))
 
@@ -511,8 +516,11 @@ class TorchAll2AllDispatcher(
         else:
             return TorchAll2AllPostDispatchResult(
                 hidden_states=global_input_tokens,
+                hidden_scales=None,
                 row_ids_map=row_ids_map,
                 tokens_per_expert=tokens_per_expert,
+                rows=rows_from_counts(tokens_per_expert),
+                expert_weights=ExpertWeights(),
             )
 
     @override

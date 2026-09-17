@@ -1,9 +1,15 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import (
+    Any,
     Generic,
     Literal,
+    NamedTuple,
+    Protocol,
     TypeAlias,
     TypeVar,
+    runtime_checkable,
 )
 
 import torch
@@ -31,6 +37,273 @@ def _get_backward_hook(backward_finished_event: torch.cuda.Event):
     return _backward_hook
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Unified EP contract: how a dispatcher describes the expert batch it produced, and the seams an EP execution
+# runtime (UltraEP / MoonEP style) plugs into. No communication or GEMM library is imported here.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class Layout(str, Enum):
+    """Row-layout families of a dispatched expert batch.
+
+    ``ExpertRows`` describes ``E0`` and ``EA``; ``R`` and ``M`` are reserved for backends that need a gather index
+    or a per-expert mask and are not expressible by ``ExpertRows`` yet.
+    """
+
+    E0 = "expert_contig"  # per-expert contiguous rows, no padding (``alignment == 1``)
+    EA = "expert_aligned"  # per-expert segments aligned to ``alignment`` rows, zero padding rows in between
+    R = "rank_grouped"  # reserved: rows grouped by source rank plus a gather index (SonicMoE-style consumers)
+    M = "masked"  # reserved: ``[experts, max_rows, hidden]`` with a per-expert mask (decode / low latency)
+
+
+class ExpertRows(NamedTuple):
+    """Row layout of one dispatched expert batch on the local rank.
+
+    Invariants (all tensors are GPU integer tensors of shape ``[P]``, ``P`` local compute slots):
+
+    * ``starts[0] == 0`` and ``starts[i + 1] == starts[i] + compute_counts[i]``.
+    * Real tokens of slot ``i`` occupy the prefix ``[starts[i], starts[i] + valid_counts[i])``.
+    * ``valid_counts <= compute_counts``; ``compute_counts`` is a multiple of ``alignment``.
+    * ``starts[-1] + compute_counts[-1] <= hidden_states.shape[0]`` (the buffer capacity may exceed it).
+
+    ``alignment == 1`` is the unpadded legacy layout (``E0``); ``alignment > 1`` is the segment-aligned layout
+    (``EA``) that psum-style grouped GEMMs consume without a permute. Alignment padding rows are finite zeros when
+    ``padding_zeroed`` is set; rows past the last slot are unspecified and must never be reduced over.
+    """
+
+    starts: torch.Tensor
+    compute_counts: torch.Tensor
+    valid_counts: torch.Tensor | None
+    alignment: int
+    padding_zeroed: bool
+    host_counts: torch.Tensor | None = None
+
+    @property
+    def num_slots(self) -> int:
+        return int(self.compute_counts.shape[0])
+
+    @property
+    def layout(self) -> Layout:
+        """Layout family derived from ``alignment``; ``ExpertRows`` never carries a stored layout field."""
+        return Layout.EA if self.alignment > 1 else Layout.E0
+
+
+def rows_from_counts(counts: torch.Tensor, *, host_counts: torch.Tensor | None = None) -> ExpertRows:
+    """Describe plain per-expert counts (the legacy ``tokens_per_expert``) as an unpadded ``ExpertRows``.
+
+    Args:
+        counts (torch.Tensor): GPU ``[P]`` integer token counts, no padding.
+        host_counts (torch.Tensor | None): Optional CPU mirror of ``counts``.
+
+    Returns:
+        ExpertRows: Contiguous, unpadded layout with ``valid_counts is compute_counts``.
+    """
+    starts = torch.cumsum(counts, 0) - counts
+    return ExpertRows(
+        starts=starts,
+        compute_counts=counts,
+        valid_counts=counts,
+        alignment=1,
+        padding_zeroed=True,
+        host_counts=host_counts,
+    )
+
+
+def rows_from_psum(
+    psum: torch.Tensor,
+    valid_counts: torch.Tensor,
+    *,
+    alignment: int,
+    padding_zeroed: bool,
+    host_counts: torch.Tensor | None = None,
+) -> ExpertRows:
+    """Describe a segment-aligned layout given DeepEP-V2 / DeepGEMM style prefix sums.
+
+    ``psum[i]`` is the real end row of slot ``i`` (``starts[i] + valid_counts[i]``) and slot ``i + 1`` starts at
+    ``psum[i]`` rounded up to ``alignment``.
+
+    Args:
+        psum (torch.Tensor): GPU ``[P]`` int32, real end row per slot.
+        valid_counts (torch.Tensor): GPU ``[P]`` int32, real token count per slot.
+        alignment (int): Segment alignment in rows.
+        padding_zeroed (bool): Whether the producer zero-filled the alignment padding rows.
+        host_counts (torch.Tensor | None): Optional CPU mirror of the compute counts.
+
+    Returns:
+        ExpertRows: Aligned layout consumable by counts-only and psum-aware grouped GEMMs alike.
+    """
+    psum = psum.to(torch.int32)
+    valid_counts = valid_counts.to(torch.int32)
+    starts = psum - valid_counts
+    ends_aligned = psum if alignment == 1 else (psum + (alignment - 1)) // alignment * alignment
+    return ExpertRows(
+        starts=starts,
+        compute_counts=ends_aligned - starts,
+        valid_counts=valid_counts,
+        alignment=alignment,
+        padding_zeroed=padding_zeroed,
+        host_counts=host_counts,
+    )
+
+
+def rows_psum(rows: ExpertRows) -> torch.Tensor:
+    """Real end row per slot (``starts + valid_counts``): DeepGEMM's ``grouped_layout`` for its psum layout."""
+    valid = rows.valid_counts if rows.valid_counts is not None else rows.compute_counts
+    return rows.starts + valid
+
+
+def check_rows(rows: ExpertRows, capacity: int) -> None:
+    """Debug-only invariant check; it synchronizes with the host, so never call it on the hot path.
+
+    Args:
+        rows (ExpertRows): The layout to check.
+        capacity (int): Number of rows of the hidden-states buffer.
+    """
+    starts = rows.starts.cpu()
+    compute = rows.compute_counts.cpu()
+    if starts.numel() == 0:
+        return
+    assert int(starts[0]) == 0, "first slot must start at row 0"
+    ends = starts + compute
+    assert torch.equal(ends[:-1], starts[1:]), "slots must be contiguous"
+    assert int(ends[-1]) <= capacity, f"rows exceed capacity: {int(ends[-1])} > {capacity}"
+    assert bool((compute % rows.alignment == 0).all()), "compute_counts must be multiples of alignment"
+    if rows.valid_counts is not None:
+        valid = rows.valid_counts.cpu()
+        assert bool((valid <= compute).all()) and bool((valid >= 0).all()), "valid_counts out of range"
+
+
+class GradBinding(NamedTuple):
+    path: Literal["autograd", "external"]
+    buffer: torch.Tensor | None = None
+    write_op: Literal["overwrite", "add"] | None = None
+
+
+class ProjectionWeight(NamedTuple):
+    value: torch.Tensor
+    backward_read: Literal["saved", "restore_before_dgrad"] = "saved"
+    grad: GradBinding = GradBinding("autograd")
+
+
+class ExpertWeightSegment(NamedTuple):
+    first_slot: int
+    w1w3: ProjectionWeight
+    w2: ProjectionWeight
+
+
+class ExpertWeights(NamedTuple):
+    """Call-local expert weights; ``segments is None`` means "use the expert module's own parameters"."""
+
+    segments: tuple[ExpertWeightSegment, ...] | None = None
+
+
+@dataclass(frozen=True)
+class DispatcherCaps:
+    """Static capabilities a dispatcher declares for configuration-time checks and scheduling decisions."""
+
+    name: str
+    produces_alignment: int = 1
+    host_counts: bool = True
+    host_sync_free: bool = False
+    static_shape: bool = False
+    combine_applies_probs: bool = False
+    fp8_dispatch: bool = False
+    hidden_multiple: int = 1
+
+    @property
+    def produces_layout(self) -> Layout:
+        """Layout family of the batches this dispatcher produces, derived from ``produces_alignment``."""
+        return Layout.EA if self.produces_alignment > 1 else Layout.E0
+
+
+@dataclass
+class EPCall:
+    """Per-invocation control state of one MoE layer call (plans, events, backend handles).
+
+    It travels through the execution hooks and ``dispatch_preprocess`` and never enters the compiled expert block.
+    """
+
+    layer_idx: int
+    micro_batch: int = 0
+    plan: Any = None
+    events: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class LayerEPExecution(Protocol):
+    """Per-layer hooks of a model-scoped EP execution runtime; the default implementation is identity."""
+
+    def prepare_layer_inputs(self, inputs: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[EPCall]]: ...
+
+    def prepare_dispatch(
+        self, call: EPCall, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+    def prepare_experts(self, call: EPCall, batch: "PostDispatchResult") -> "PostDispatchResult": ...
+
+    def attach_after_experts(self, call: EPCall, output: torch.Tensor) -> torch.Tensor: ...
+
+    def attach_after_combine(self, call: EPCall, output: torch.Tensor) -> torch.Tensor: ...
+
+
+class NoOpLayerEPExecution:
+    """Identity hooks: no autograd nodes, no stream work.
+
+    Args:
+        layer_idx (int): Index of the layer the hooks are bound to.
+    """
+
+    def __init__(self, layer_idx: int = 0) -> None:
+        self._layer_idx = layer_idx
+
+    def prepare_layer_inputs(self, inputs: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[EPCall]]:
+        return inputs, [EPCall(layer_idx=self._layer_idx, micro_batch=i) for i in range(len(inputs))]
+
+    def prepare_dispatch(
+        self, call: EPCall, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hidden_states, topk_ids, topk_weights
+
+    def prepare_experts(self, call: EPCall, batch: "PostDispatchResult") -> "PostDispatchResult":
+        return batch
+
+    def attach_after_experts(self, call: EPCall, output: torch.Tensor) -> torch.Tensor:
+        return output
+
+    def attach_after_combine(self, call: EPCall, output: torch.Tensor) -> torch.Tensor:
+        return output
+
+
+@runtime_checkable
+class EPExecutionRuntime(Protocol):
+    """Model-scoped EP execution runtime: the four boundaries the model calls unconditionally."""
+
+    def bind_layer(self, *, layer_fqn: str, layer_idx: int, projections: tuple[Any, Any]) -> LayerEPExecution: ...
+
+    def validate_before_fsdp(self, fsdp_config: Any) -> None: ...
+
+    def install_after_fsdp(self, *, fsdp_root: Any, execution_order: list[str]) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class NoOpEPExecutionRuntime:
+    """Runtime for backends without model-scoped resources."""
+
+    def bind_layer(self, *, layer_fqn: str, layer_idx: int, projections: tuple[Any, Any]) -> LayerEPExecution:
+        return NoOpLayerEPExecution(layer_idx)
+
+    def validate_before_fsdp(self, fsdp_config: Any) -> None:
+        return
+
+    def install_after_fsdp(self, *, fsdp_root: Any, execution_order: list[str]) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
 class PreDispatchResult(TypedDict):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
@@ -42,23 +315,24 @@ class DispatchResult(TypedDict):
 
 
 class PostDispatchResult(TypedDict):
-    """Result of the dispatch operation during prefilling phase.
+    """The expert batch a dispatcher hands to ``MoEBlock.forward`` (one object, fixed keys).
 
-    This class holds the dispatched result during the prefilling phase. `hidden_states` and
-    `tokens_per_expert` are used for the experts forwarding. `topk_weights` contains the
-    routing weights. Some dispatcher could apply weighted sum during combining to reduce the communication,
-    `handle` is used to facilitate the combination of expert outputs after processing.
+    Keys are fixed because ``torch.compile`` rejects optional-key TypedDicts. ``tokens_per_expert`` always equals
+    ``rows.compute_counts`` and exists for counts-only grouped GEMM kernels.
 
     Attributes:
-        hidden_states: The hidden states after expert token routing and dispatching.
-        tokens_per_expert: Count of tokens assigned to each expert in the current batch.
-        topk_weights: Expert routing weights used for scaling hidden states when combining results.
-        handle: An object that facilitates the combination of expert outputs after processing.
+        hidden_states: The dispatched activations, ``[capacity, hidden]`` in the layout described by ``rows``.
+        hidden_scales: Per-tile FP8 scales when the dispatcher delivers quantized activations, else ``None``.
+        tokens_per_expert: Rows a grouped GEMM may touch per local expert (alias of ``rows.compute_counts``).
+        rows: Explicit row layout of the batch, see :class:`ExpertRows`.
+        expert_weights: Call-local expert weights, see :class:`ExpertWeights`.
     """
 
-    # TODO:
     hidden_states: torch.Tensor
+    hidden_scales: torch.Tensor | None
     tokens_per_expert: torch.Tensor
+    rows: ExpertRows
+    expert_weights: ExpertWeights
 
 
 class PreCombineResult(TypedDict):
@@ -109,6 +383,8 @@ class GenericDispatcher(
         self._n_routed_experts = n_routed_experts
         self._training_dtype = training_dtype
         self._generate_dtype = generate_dtype
+        # Legacy dispatchers permute into the unpadded layout and return exact counts on the GPU.
+        self.caps = DispatcherCaps(name=type(self).__name__)
 
     @abstractmethod
     def dispatch(
@@ -137,7 +413,11 @@ class GenericDispatcher(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         async_op: bool = False,
-    ) -> PreDispatch: ...
+        tokens_per_expert: torch.Tensor | None = None,
+        layer_state: EPCall | None = None,
+    ) -> PreDispatch:
+        """Stage 1 of 6. ``tokens_per_expert`` are the router's logical counts and ``layer_state`` the call's
+        control state; dispatchers that plan ahead (MoonEP-style) read them, the others ignore them."""
 
     @abstractmethod
     def combine_preprocess(
@@ -260,6 +540,8 @@ class NaiveDispatcher(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         async_op: bool = False,
+        tokens_per_expert: torch.Tensor | None = None,  # noqa: ARG002 — contract seam, unused by this dispatcher
+        layer_state: EPCall | None = None,  # noqa: ARG002
     ) -> NaivePreDispatchResult:
         if async_op:
             if self._expert_tp is None:
@@ -407,8 +689,11 @@ class NaiveDispatcher(
         else:
             return NaivePostDispatchResult(
                 hidden_states=hidden_states,
+                hidden_scales=None,
                 row_ids_map=row_id_maps,
                 tokens_per_expert=tokens_per_expert,
+                rows=rows_from_counts(tokens_per_expert),
+                expert_weights=ExpertWeights(),
             )
 
     @override

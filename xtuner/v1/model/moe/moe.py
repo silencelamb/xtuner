@@ -73,6 +73,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerOutput,
     MoEGate,
 )
+from xtuner.v1.module.dispatcher import EPExecutionRuntime, NoOpEPExecutionRuntime
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
@@ -257,10 +258,13 @@ class MoE(BaseModel):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
 
+        # Model-scoped EP execution runtime (identity until a backend such as UltraEP / MoonEP provides one).
+        self.ep_runtime: EPExecutionRuntime = NoOpEPExecutionRuntime()
         self.layers = self.build_layers(config)
         self.rotary_emb = self.build_rotary_embedding(config)
         self.embed_tokens = self.build_embeddings(config)
         self.mtp_block = self.build_mtp_block(config) if config.mtp_config is not None else None
+        self._bind_ep_execution()
         self._configure_model_specific_layers()
 
         self.fp32_layers = [self.rotary_emb]
@@ -275,6 +279,18 @@ class MoE(BaseModel):
             n_routed_experts=self.config.n_routed_experts,
             num_experts_per_tok=self.config.num_experts_per_tok,
         )
+
+    def _bind_ep_execution(self) -> None:
+        """Hand every MoE decoder layer (main stack and MTP) its per-layer EP execution hooks."""
+        for name, module in self.named_modules():
+            if isinstance(module, MoEDecoderLayer):
+                module.bind_ep_execution(
+                    self.ep_runtime.bind_layer(
+                        layer_fqn=name,
+                        layer_idx=module.layer_idx,
+                        projections=(module.experts.fused_w1w3, module.experts.fused_w2),
+                    )
+                )
 
     @override
     @torch.no_grad()
@@ -1273,6 +1289,7 @@ class MoE(BaseModel):
             lm_head_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
         else:
             lm_head_mp_policy = self.mp_policy
+        self.ep_runtime.validate_before_fsdp(fsdp_config)
         self._init_device_mesh(fsdp_config)
 
         if self.config.float8_cfg is not None:
@@ -1408,6 +1425,10 @@ class MoE(BaseModel):
             if isinstance(module, nn.Embedding):
                 module.forward = types.MethodType(self.patched_emb_forward, module)  # type: ignore
 
+        self.ep_runtime.install_after_fsdp(
+            fsdp_root=self,
+            execution_order=[name for name, module in self.named_modules() if isinstance(module, MoEDecoderLayer)],
+        )
         self._init_load_spec()
         self._to_empty_meta()
         return self
