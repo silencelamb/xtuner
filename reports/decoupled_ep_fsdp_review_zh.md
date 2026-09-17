@@ -1,6 +1,6 @@
 # FSDP / EP 解耦代码审查结论
 
-> 状态更新（2026-09-03）：C1 已由 commit `5923dc1d`（`[Fix] Gather RL layer-wise weights with the submodule that owns them`）修复，并附 `tests/rl/test_weight_iterator.py::TestLayerBatchesGatherWithParamOwner` 回归测试；N4 已在上游 main 修复。W1、W2、N1–N3 与 L1–L3 gate 仍待处理。以下正文保持审查时原样。
+> 状态更新（2026-09-03）：C1 已由 commit `5923dc1d`（`[Fix] Gather RL layer-wise weights with the submodule that owns them`）修复，并附 `tests/rl/test_weight_iterator.py::TestLayerBatchesGatherWithParamOwner` 回归测试；N4 已在上游 main 修复。N1 与 W5 已处理：`FSDPConfig` 的拓扑约束改为 `@model_validator` + `ValueError`，`_init_decoupled_device_mesh` 的运行时校验改为显式 `ValueError`（L0 回归用例 `test_config_rejects_non_positive_sizes`、`test_runtime_rejects_shard_size_not_dividing_world_size`）；L1–L3 的验收条件落成 8 卡 pytest gate `tests/engine/test_decoupled_ep_fsdp_train_engine.py`，实验脚本改为复用 `xtuner/_testing/decoupled_ep_fsdp.py`。W1、W2、N2、N3 仍待处理。以下正文保持审查时原样。
 
 ## 1. 审查范围与总评
 
