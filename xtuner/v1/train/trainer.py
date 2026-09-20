@@ -1552,12 +1552,13 @@ class Trainer:
 
     def _init_xtuner_meta(self, work_dir: Path, auto_resume: bool) -> XTunerMeta:
         # TODO: simplify with XTunerMeta.build() of dist version
-        if not work_dir.exists():
-            if self.rank == 0:
-                work_dir.mkdir(parents=True, exist_ok=True)
+        # Only rank 0 probes paths before creating them: on NFS a negative lookup from another node is cached
+        # (negative dentry), so a rank that stats a not-yet-created file keeps seeing ENOENT after the barrier.
+        if self.rank == 0 and not work_dir.exists():
+            work_dir.mkdir(parents=True, exist_ok=True)
 
         meta_path = work_dir / self._META_PATH
-        if not meta_path.exists() and self.rank == 0:
+        if self.rank == 0 and not meta_path.exists():
             meta = XTunerMeta(exps=[])
             with open(meta_path, "w") as f:
                 f.write(meta.model_dump_json(indent=2))
@@ -1574,7 +1575,7 @@ class Trainer:
             git_dir = exp_dir / f"git-info-begin-{begin}"
 
             staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
-            if not git_dir.exists() and self.rank == 0:
+            if self.rank == 0 and not git_dir.exists():
                 git_dir.mkdir(parents=True, exist_ok=True)
                 commit = record_git_info(staged_path, unstaged_path)
                 _commit_tmp = [commit]
@@ -1606,7 +1607,7 @@ class Trainer:
             exp_dir = work_dir / timestamp
             git_dir = Path(f"{exp_dir}/git-info-begin-{0}")
 
-            if not git_dir.exists() and self.rank == 0:
+            if self.rank == 0 and not git_dir.exists():
                 git_dir.mkdir(parents=True, exist_ok=True)
             dist.barrier()
 
