@@ -109,11 +109,16 @@ optim_cfg = AdamWConfig(
     lr=float(os.environ.get("LR", "1e-6")), foreach=False, swap_optimizer=_bool("SWAP_OPTIMIZER", False)
 )
 lr_cfg = LRConfig(lr_type="cosine", warmup_ratio=0.0)
+hsdp_sharding_size = os.environ.get("HSDP_SHARDING_SIZE")
 fsdp_cfg = FSDPConfig(
     cpu_offload=False,
     ep_size=ep_size,
     torch_compile=_bool("TORCH_COMPILE", True),
     recompute_ratio=float(os.environ.get("RECOMPUTE_RATIO", "1.0")),
+    # DECOUPLE_EP_FSDP=1: dp2ep layout (PR #2093) -- dense params sharded over the full FSDP mesh instead of
+    # being replicated ep_size times; experts sharded dp_shard / ep_size ways on top of EP.
+    decouple_ep_fsdp=_bool("DECOUPLE_EP_FSDP", False),
+    hsdp_sharding_size=int(hsdp_sharding_size) if hsdp_sharding_size else None,
 )
 
 trainer = TrainerConfig(
