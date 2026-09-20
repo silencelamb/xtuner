@@ -4,6 +4,8 @@ from functools import lru_cache
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, List, Optional, Tuple, Union, cast
 
+import os
+
 import torch
 import torch.distributed as dist
 from deep_ep import Buffer, EventOverlap
@@ -19,9 +21,10 @@ _buffer: Optional[Buffer] = None
 
 _low_latency_buffer: Optional[Buffer] = None
 # Set the number of SMs to use
-# NOTES: this is a static variable
-# Buffer.set_num_sms(24)
-Buffer.set_num_sms(20)
+# NOTES: this is a static variable. For an EP group that spans nodes, DeepEP's internode kernels require the QP
+# count (max(local experts, num_sms // 2), see below) to equal num_sms // 2 or to be >= num_sms
+# (csrc/kernels/internode.cu:386); e.g. 256 experts over EP16 -> 16 local experts -> set XTUNER_DEEPEP_NUM_SMS=32.
+Buffer.set_num_sms(int(os.environ.get("XTUNER_DEEPEP_NUM_SMS", "20")))
 
 
 # You may call this function at the framework initialization
