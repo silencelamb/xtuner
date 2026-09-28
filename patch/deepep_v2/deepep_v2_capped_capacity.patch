@@ -1,0 +1,175 @@
+diff --git a/csrc/elastic/buffer.hpp b/csrc/elastic/buffer.hpp
+index 0700646..31c6382 100644
+--- a/csrc/elastic/buffer.hpp
++++ b/csrc/elastic/buffer.hpp
+@@ -723,9 +723,13 @@ public:
+              const bool& allocate_on_comm_stream,
+              const bool& do_handle_copy, const bool& do_cpu_sync,
+              const bool& do_expand, const bool& do_zero_padding,
+-             const bool& use_tma_aligned_col_major_sf) const {
++             const bool& use_tma_aligned_col_major_sf,
++             const std::optional<int>& num_max_expanded_tokens,
++             const std::optional<torch::Tensor>& overflow_flag) const {
+         // Check SM count
+         EP_HOST_ASSERT(num_sms > 0);
++        if (overflow_flag.has_value())
++            EP_HOST_ASSERT(overflow_flag->is_cuda() and overflow_flag->scalar_type() == torch::kInt and overflow_flag->numel() >= 1);
+ 
+         // Zero padding only makes sense with expand mode
+         EP_HOST_ASSERT(not do_zero_padding or do_expand);
+@@ -1068,6 +1072,14 @@ public:
+             num_expanded_tokens = nccl_context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_local_experts);
+             num_expanded_tokens += (expert_alignment - 1) * num_local_experts;
+             num_expanded_tokens = math::align(num_expanded_tokens, expert_alignment);
++            if (num_max_expanded_tokens.has_value()) {
++                // Capped receive capacity (e.g. a multiple of the balanced expectation instead of the worst case);
++                // the copy epilogue flags `overflow_flag` and drops rows if the real expanded count exceeds it.
++                EP_HOST_ASSERT(do_expand and num_max_expanded_tokens.value() > 0);
++                const auto capped = math::align(num_max_expanded_tokens.value() + (expert_alignment - 1) * num_local_experts,
++                                                expert_alignment);
++                num_expanded_tokens = std::min(num_expanded_tokens, capped);
++            }
+         }
+ 
+         // Allocate received tensors
+@@ -1143,6 +1155,8 @@ public:
+                                       num_channels,
+                                       do_expand, cached_mode,
+                                       do_zero_padding,
++                                      num_allocated_tokens,
++                                      overflow_flag.has_value() ? overflow_flag->data_ptr<int>() : nullptr,
+                                       comm_stream);
+ 
+         // Stream control
+diff --git a/csrc/kernels/elastic/dispatch.hpp b/csrc/kernels/elastic/dispatch.hpp
+index 3b624c6..bfa2f56 100644
+--- a/csrc/kernels/elastic/dispatch.hpp
++++ b/csrc/kernels/elastic/dispatch.hpp
+@@ -253,6 +253,7 @@ public:
+         int num_recv_tokens;
+         int recv_sf_token_stride, recv_sf_hidden_stride;
+         int scaleout_rank_idx, scaleup_rank_idx;
++        int num_allocated_tokens; int* overflow_flag;
+ 
+         jit::LaunchArgs launch_args;
+     };
+@@ -286,7 +287,8 @@ static void __instantiate_kernel() {{
+                                                  args.num_unaligned_recv_tokens_per_expert,
+                                                  args.num_recv_tokens,
+                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
+-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
++                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
++                                                 args.num_allocated_tokens, args.overflow_flag));
+     }
+ };
+ 
+@@ -308,6 +310,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
+                                           const int& num_channels,
+                                           const bool& do_expand, const bool& cached_mode,
+                                           const bool& do_zero_padding,
++                                          const int& num_allocated_tokens, int* overflow_flag,
+                                           const at::cuda::CUDAStream& stream) {
+     // Maximize shared memory utilization
+     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+@@ -333,6 +336,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
+         .num_recv_tokens = num_recv_tokens,
+         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
+         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
++        .num_allocated_tokens = num_allocated_tokens, .overflow_flag = overflow_flag,
+         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
+     const auto code = DispatchCopyEpilogueRuntime::generate(args);
+     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);
+diff --git a/deep_ep/buffers/elastic.py b/deep_ep/buffers/elastic.py
+index a2862c0..f259b4e 100644
+--- a/deep_ep/buffers/elastic.py
++++ b/deep_ep/buffers/elastic.py
+@@ -870,7 +870,9 @@ class ElasticBuffer:
+                  do_cpu_sync: Optional[bool] = None,
+                  do_expand: bool = False,
+                  do_zero_padding: bool = False,
+-                 use_tma_aligned_col_major_sf: bool = False) \
++                 use_tma_aligned_col_major_sf: bool = False,
++                 num_max_expanded_tokens: Optional[int] = None,
++                 overflow_flag: Optional[torch.Tensor] = None) \
+             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                      Optional[torch.Tensor], Optional[torch.Tensor],
+                      EPHandle, EventOverlap]:
+@@ -913,6 +915,10 @@ class ElasticBuffer:
+             do_zero_padding: whether to zero out the alignment padding slots in the expanded output.
+                 Only valid when `do_expand` is True. Ensures alignment gaps between experts are zeroed.
+             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
++            num_max_expanded_tokens: optional cap of the received (expanded) rows when `do_cpu_sync=False`, e.g. a
++                multiple of the balanced expectation instead of the worst case; rows beyond it are dropped and
++                `overflow_flag` (a CUDA int32 tensor) is set to 1, the caller must check it and retry with more.
++            overflow_flag: optional CUDA int32 tensor written to 1 by the copy epilogue on capacity overflow.
+ 
+         Returns:
+             recv_x: received tokens, the same type and tuple as the input `x`
+@@ -993,7 +999,8 @@ class ElasticBuffer:
+                                         async_with_compute_stream, allocate_on_comm_stream,
+                                         do_handle_copy, do_cpu_sync, do_expand,
+                                         do_zero_padding,
+-                                        use_tma_aligned_col_major_sf)
++                                        use_tma_aligned_col_major_sf,
++                                        num_max_expanded_tokens, overflow_flag)
+ 
+         # Create handle
+         is_cached_dispatch = handle is not None
+diff --git a/deep_ep/include/deep_ep/impls/dispatch_copy_epilogue.cuh b/deep_ep/include/deep_ep/impls/dispatch_copy_epilogue.cuh
+index 94c596b..1b7c2e7 100644
+--- a/deep_ep/include/deep_ep/impls/dispatch_copy_epilogue.cuh
++++ b/deep_ep/include/deep_ep/impls/dispatch_copy_epilogue.cuh
+@@ -30,7 +30,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+                             int* num_unaligned_recv_tokens_per_expert,
+                             int num_recv_tokens,
+                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
+-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
++                            const int scaleout_rank_idx, const int scaleup_rank_idx,
++                            const int num_allocated_tokens, int* overflow_flag) {
+     // Utils
+     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
+     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
+@@ -120,6 +121,13 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+         } else if (kDoExpand and not kCachedMode and dst_expert_idx >= 0) {
+             dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
+         }
++        if (kDoExpand and dst_tensor_idx >= num_allocated_tokens) {
++            // The receive tensor may be smaller than the worst case (capped capacity): flag and drop the row
++            // instead of writing out of bounds; the caller checks the flag and must retry with more capacity.
++            if (overflow_flag != nullptr)
++                atomicExch(overflow_flag, 1);
++            dst_tensor_idx = -1;
++        }
+         __syncwarp();
+ 
+         // Wait for TMA arrival
+@@ -285,8 +293,13 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+             if (wave_idx >= kNumExpertsPerLane)
+                 break;
+ 
++            // Padding rows past a capped capacity are dropped (flagged) rather than written out of bounds
++            const bool pad_in_range = dst_tensor_idx < num_allocated_tokens;
++            if (not pad_in_range and overflow_flag != nullptr and ptx::elect_one_sync())
++                atomicExch(overflow_flag, 1);
++
+             // Zero data via TMA store
+-            if (ptx::elect_one_sync()) {
++            if (pad_in_range and ptx::elect_one_sync()) {
+                 ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
+                                   tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                 ptx::tma_store_commit();
+@@ -294,12 +307,12 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+             __syncwarp();
+ 
+             // Zero weights
+-            if (recv_topk_weights != nullptr and ptx::elect_one_sync())
++            if (pad_in_range and recv_topk_weights != nullptr and ptx::elect_one_sync())
+                 recv_topk_weights[dst_tensor_idx] = 0.0f;
+             __syncwarp();
+ 
+             // Zero SF
+-            if constexpr (kNumSFPacks > 0) {
++            if constexpr (kNumSFPacks > 0) if (pad_in_range) {
+                 const auto recv_sf_token_stride_i64 = static_cast<int64_t>(recv_sf_token_stride);
+                 const auto recv_sf_hidden_stride_i64 = static_cast<int64_t>(recv_sf_hidden_stride);
+                 constexpr sf_pack_t zero_sf_pack = {0};
