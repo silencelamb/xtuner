@@ -19,6 +19,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
 )
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.utils._pytree import tree_flatten
 from tqdm import tqdm
 from typing_extensions import overload, override
 
@@ -1363,11 +1364,6 @@ class MoE(BaseModel):
                 self._fully_shard_expert_blocks(
                     layer,
                     mp_policy=mp_policy,
-                    reshard_after_forward=(
-                        False
-                        if layer_idx >= len(self.layers) - 1 and self.mtp_block is None
-                        else self.fsdp_config.reshard_after_forward
-                    ),
                 )
             if self._should_recompute(
                 layer_idx=layer_idx,
@@ -1391,6 +1387,8 @@ class MoE(BaseModel):
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                 module=layer,
             )
+            if decoupled:
+                self._reshard_expert_blocks_per_layer(layer, reshard_after_forward=reshard_after_forward)
 
         for layer_cur, layer_next in zip(
             list(self.layers.values())[:-1],
@@ -1407,6 +1405,7 @@ class MoE(BaseModel):
         if decoupled:
             last_layer = list(self.layers.values())[-1]
             last_layer.set_modules_to_forward_prefetch(self._expert_blocks(last_layer))  # type: ignore
+            self._set_expert_backward_prefetch(list(self.layers.values()))
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -1446,9 +1445,7 @@ class MoE(BaseModel):
 
                 reshard_after_forward = mtp_idx != len(self.mtp_block.layers) - 1
                 if decoupled:
-                    self._fully_shard_expert_blocks(
-                        mtp_layer, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward
-                    )
+                    self._fully_shard_expert_blocks(mtp_layer, mp_policy=mp_policy)
                 self._fully_shard(
                     mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                     mp_policy=mp_policy,
@@ -1456,6 +1453,8 @@ class MoE(BaseModel):
                     offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                     module=mtp_layer,
                 )
+                if decoupled:
+                    self._reshard_expert_blocks_per_layer(mtp_layer, reshard_after_forward=reshard_after_forward)
                 if mtp_idx == 0:
                     if decoupled:
                         layer_next.set_modules_to_forward_prefetch(  # type: ignore
@@ -1478,6 +1477,7 @@ class MoE(BaseModel):
                 if decoupled:
                     last_mtp_layer = list(self.mtp_block.layers)[-1]
                     last_mtp_layer.set_modules_to_forward_prefetch(self._expert_blocks(last_mtp_layer))  # type: ignore
+                    self._set_expert_backward_prefetch(list(self.mtp_block.layers))
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -1486,6 +1486,8 @@ class MoE(BaseModel):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
         self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
+        if decoupled:
+            self._reshard_expert_blocks_before_forward()
 
         for _, module in self.named_modules():
             if isinstance(module, nn.Embedding):
@@ -1760,18 +1762,84 @@ class MoE(BaseModel):
         self,
         module: nn.Module,
         mp_policy: MixedPrecisionPolicy,
-        reshard_after_forward: bool,
     ) -> None:
+        # Each routed-expert block becomes its own FSDP unit on `expert_fsdp_mesh`, nested inside the layer
+        # and therefore inside the layer's reentrant activation checkpoint. FSDP2's automatic reshard would
+        # then run after every call of the block: once per intra-layer micro-batch in forward, again for every
+        # call the checkpoint replays in backward, and once per micro-batch backward, each followed by a fresh
+        # all-gather. Automatic reshard is disabled here; `_reshard_expert_blocks_per_layer` reshards the
+        # group once after the layer's forward and once after the layer's backward instead.
         assert self.expert_fsdp_mesh is not None
         assert self.fsdp_config is not None
         for expert_block in self._expert_blocks(module):
             self._fully_shard(
                 mesh=self.expert_fsdp_mesh,
                 mp_policy=mp_policy,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=False,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                 module=expert_block,
             )
+            expert_block.set_reshard_after_backward(False)  # type: ignore[operator]
+
+    def _set_expert_backward_prefetch(self, layers: list[nn.Module]) -> None:
+        # FSDP2 picks each unit's default backward prefetch target from the order in which units finished
+        # forward. Checkpoint replay re-runs the expert units' forward hooks during backward and appends to that
+        # order, so an expert group's default target becomes the experts of the layer above, whose backward is
+        # already done: an all-gather that is never used and stays allocated until the end of backward. Nothing
+        # prefetches the dense unit of the layer below either, so its all-gather is issued on demand behind this
+        # layer's dense reduce-scatter on the same process group. Point every expert group at the layer below;
+        # an explicit list replaces the default target.
+        for layer_prev, layer_cur in zip(layers[:-1], layers[1:]):
+            for expert_block in self._expert_blocks(layer_cur):
+                expert_block.set_modules_to_backward_prefetch([layer_prev])  # type: ignore[operator]
+
+    def _reshard_expert_blocks_per_layer(self, layer: nn.Module, reshard_after_forward: bool) -> None:
+        # `layer` is the outer FSDP unit, which wraps the checkpoint boundary: checkpoint replay calls the
+        # wrapped module, not this one, so the forward hook below runs for the original forward only, and the
+        # gradient of the layer inputs is produced only after the whole layer backward (replay, every
+        # micro-batch backward and the experts' reduce-scatter launch). `reshard_after_forward` follows the
+        # layer's own setting, so the last layer keeps its experts gathered into backward like its dense group.
+        experts = self._expert_blocks(layer)
+
+        def reshard_experts() -> None:
+            for expert_block in experts:
+                expert_block.reshard()  # type: ignore[operator]
+
+        def reshard_after_layer_backward(module: nn.Module, args: tuple, kwargs: dict) -> None:
+            if not torch.is_grad_enabled():
+                return None
+            inputs = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor) and t.requires_grad]
+            resharded = [False]
+
+            def on_input_grad(grad: torch.Tensor) -> None:
+                if not resharded[0]:
+                    resharded[0] = True
+                    reshard_experts()
+
+            for tensor in inputs:
+                tensor.register_hook(on_input_grad)
+            return None
+
+        def reshard_after_layer_forward(module: nn.Module, args: tuple, kwargs: dict, output: object) -> None:
+            if reshard_after_forward:
+                reshard_experts()
+            return None
+
+        layer.register_forward_pre_hook(reshard_after_layer_backward, with_kwargs=True)
+        layer.register_forward_hook(reshard_after_layer_forward, with_kwargs=True)
+
+    def _reshard_expert_blocks_before_forward(self) -> None:
+        # Correctness guard: an expert group still gathered when the next forward starts would skip its
+        # all-gather and compute with the weights from before the optimizer step. A no-op whenever every
+        # layer's backward hook has fired.
+        experts = [expert_block for expert_block in self.modules() if isinstance(expert_block, MoEBlock)]
+
+        def reshard_experts(module: nn.Module, args: tuple, kwargs: dict) -> None:
+            for expert_block in experts:
+                expert_block.reshard()  # type: ignore[operator]
+            return None
+
+        self.register_forward_pre_hook(reshard_experts, with_kwargs=True)
 
     def _init_decoupled_device_mesh(self, fsdp_config: FSDPConfig) -> None:
         # Decoupled ("dp2ep") layout: EP is a sub-dimension of the FSDP shard dimension.
