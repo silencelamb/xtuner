@@ -620,3 +620,25 @@ git worktree add --detach ../pr-2050-ultraep upstream/pr/2050
 | `docs/design/unified_grouped_gemm_v1.0.md` | 统一 Grouped GEMM 算子库设计 | `feat/deepepv2` |
 | `docs/design/decouple_ep_fsdp.md` | 解耦布局设计 | PR #2093 |
 | `patch/deepep_v2/deepep_v2_capped_capacity.patch` | DeepEP V2 的容量上限补丁 | 本分支 |
+
+## 10. 内部路径（共享网络盘，三台机器相同）
+
+`/workspace` 和 `/root` 是同一块共享盘，三台机器看到的是同一份文件；`/opt` 是容器本地的。
+
+| 内容 | 路径 |
+|---|---|
+| 规划仓库（私有）：文档、基准脚本、结果表 | `/workspace/large-ep-planning/` |
+| 本分支的 worktree | `/workspace/large-ep-planning/Xtuner/worktrees/exp-v2-decouple/` |
+| `feat/deepepv2` 的 worktree：Qwen3 / GLM 上 DeepEP V2 接入与调优的代码 | `/workspace/large-ep-planning/Xtuner/worktrees/deepepv2/` |
+| PR #2093 的 worktree；开发分支（多一份 `reports/`） | `.../Xtuner/worktrees/pr-decouple-ep-fsdp/`；`.../Xtuner/worktrees/decouple-ep-fsdp/` |
+| 只读对照树：上游 `7d377424`、PR #2050、PR #2056 | `.../Xtuner/worktrees/baseline/`、`pr-2050-ultraep/`、`pr-2056-moonep/` |
+| 09-23 开关版修复的本地分支（未推送） | `.../Xtuner/worktrees/decouple-noreshard/`、`decouple-bwdpf-variants/`、`pr2093-fixes-bench/` |
+| 基准入口与工具 | `/workspace/large-ep-planning/bench/moe_v2/`：`run_bench.sh`（§4.1 那条命令的脚本版）、`queue_*.sh`、`regress_legacy.sh`、`parity_vs_baseline.py`、`fsdp_trace_audit.py`、`trace_summary.py`、`aggregate_reps.py`、`summarize.py` |
+| 结果表 | `bench/moe_v2/summary_qwen3.md`、`summary_glm52.md`（按日期分节，每节写明机器与提交号） |
+| 原始 run 目录（不入库，含 `stdout.log`、`env.txt`、trace） | `bench/moe_v2/work_dirs/`：09-28 这批在 `expmerge_2999/`；解耦相关的在 `mb2_1727/`、`rebase_2296/`、`rt_2999/`、`final_2999/`、`final16_2999_2296/`；静态模式扫描在 `exp_qwen3_sync0_*`、`exp_glm52_sync0_*`、`prof_qwen3_v2_deepgemm_sync*` |
+| DeepEP V2 静态模式的调优记录 | `bench/moe_v2/profile_qwen3_static.md`、`static_sweep.log`、`static_exp*.log`、`microbench_deepep_v2_modes.py`（2 卡微基准）、`probe_deepgemm_kgrouped_hostfree.py`；结论在规划仓库根目录 `xtuner_deepepv2_实现记录_2026-09-16.md` 第 13、16 ~ 19 条 |
+| 设计与交接文档（规划仓库根目录） | `xtuner_统一EP接口_v1.0_最终态设计与后端接入.md`、`xtuner_deepepv2_实现记录_2026-09-16.md`、`xtuner_EP布局与层内微批_结论与待办_2026-09-23.md`、`xtuner_解耦布局FSDP修复_复核意见_2026-09-23.md`、`xtuner_deepepv2_上游线_现状与交接_2026-09-28.md`；worktree 与环境重建见 `Xtuner/CLAUDE.md`、`Xtuner/WORKFLOW.md` |
+| DeepEP / DeepGEMM 源码树与编好的 wheel | `/root/build/DeepEP`（`dd758ca`，容量补丁和 6144 专家补丁以脏改动形式打着）、`/root/build/DeepGEMM`（`88965b0`）、`/root/build/wheels/`（NCCL 2.31.2 等）。同镜像的容器直接装这些 wheel，不必重编 |
+| V2 隔离站点与缓存（容器本地） | `/opt/ep-v2-site`、`/opt/ep-cache/` |
+| 模型 | 2296 / 1727：`/mnt/nvme1n1/models/Qwen3-30B-A3B`、`/mnt/nvme1n1/models/GLM-5.2-30B`；2999：`/mnt/nvme1n1/ml_research/models/` 下同名目录 |
+| 数据 | `/workspace/data/alpaca/alpaca_openai.jsonl` |
